@@ -10,7 +10,7 @@
     "versions": [
     {
         "version": "2.9.0.0",
-        "changelog": "v2.9.0\n\nChanges:\n- Improved Normal and Compact view styles\n- Added details module support for Jellyfin original content cards on mobile devices\n- Added smart list creation support to the watchlist module\n- Removed fullscreen view style\n- Replaced SVG quality badges with text-based labels\n- Applied minor improvements across several modules\n\nNotes:\n- Restart Jellyfin after update\n- A hard refresh (Ctrl + F5) may be required after updating",
+        "changelog": "v2.9.0\n\nChanges:\n- Improved Normal and Compact view styles\n- Added details module support for Jellyfin original content cards on mobile devices\n- The eye icon now opens the details module instead of the HoverTrailer module on mobile devices\n- Added smart list creation support to the watchlist module\n- Smart lists can now generate movie, TV series, and music collections based on watch and listening history\n- Added OSD clock support during playback\n- Removed fullscreen view style due to maintenance complexity\n- Replaced SVG quality badges with text-based labels\n- Quality labels now display short summaries for the default audio track\n- Included improvements from pull request #51 thanks to Vault108\n- Applied minor improvements across several modules\n\nNotes:\n- Restart Jellyfin after update\n- A hard refresh (Ctrl + F5) may be required after updating",
         "targetAbi": "10.11.0.0",
         "sourceUrl": "https://github.com/G-grbz/Jellyfin-MonWUI-Plugin/releases/download/v2.9.0/JMSFusion-2.9.0.0-server.zip",
         "checksum": "416d29ec213effe6fedd2e8282528218",
