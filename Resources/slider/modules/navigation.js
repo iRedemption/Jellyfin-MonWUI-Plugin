@@ -6,7 +6,7 @@ import { getCurrentIndex, setCurrentIndex, setRemainingTime } from "./sliderStat
 import { applyContainerStyles } from "./positionUtils.js";
 import { playNow, fetchItemDetails, getCachedUserTopGenres, getGenresForDot, goToDetailsPage } from "../../Plugins/JMSFusion/runtime/api.js";
 import { applySlideAnimation, applyDotPosterAnimation, teardownAnimations, forceReflow, nextAnimToken, hardCleanupSlide } from "./animations.js";
-import { getVideoQualityText } from "./containerUtils.js";
+import { getMetaVibrantColor, getVideoQualityText } from "./containerUtils.js";
 import { previewPreloadCache } from "./hoverTrailerModal.js";
 import { attachMiniPosterHover, openMiniPopoverFor } from "./studioHubsUtils.js";
 import { modalState, set, get, resetModalRefs } from './modalState.js';
@@ -957,6 +957,15 @@ function applyDotStateClasses(dots, currentIndex, config, lowPower = false) {
   const maxStyledDistance = 5;
 
   const safeCurrentIndex = Math.max(0, Math.min(dotArray.length - 1, currentIndex));
+  const activeSlide = document.querySelectorAll("#monwui-slides-container .monwui-slide")[safeCurrentIndex] || null;
+  const activeDotColorSeed =
+    activeSlide?.dataset?.metaColorSeed ||
+    activeSlide?.dataset?.itemId ||
+    String(safeCurrentIndex);
+  const activeDotColor =
+    config?.metaIconColors && activeDotColorSeed
+      ? getMetaVibrantColor(`${activeDotColorSeed}-active-dot`)
+      : "";
   const { start, end } = getDotWindowBounds(
     dotArray.length,
     safeCurrentIndex,
@@ -976,11 +985,14 @@ function applyDotStateClasses(dots, currentIndex, config, lowPower = false) {
       dot.dataset.dotState = "active";
       dot.dataset.dotDirection = "current";
       dot.dataset.dotDistance = "0";
+      if (activeDotColor) dot.style.setProperty("--monwui-active-dot-bg", activeDotColor);
+      else dot.style.removeProperty("--monwui-active-dot-bg");
     } else {
       const distance = Math.abs(dotIndex - safeCurrentIndex);
       const styledDistance = Math.min(distance, maxStyledDistance);
       const direction = dotIndex < safeCurrentIndex ? "prev" : "next";
       const isHidden = dotIndex < start || dotIndex > end;
+      dot.style.removeProperty("--monwui-active-dot-bg");
 
       dot.dataset.dotState = isHidden ? "hidden" : direction;
       dot.dataset.dotDirection = direction;

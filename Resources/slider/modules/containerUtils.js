@@ -27,7 +27,7 @@ function buildMetaTextSpan(text, ...classNames) {
   return `<span class="${className}">${escapeMetaHtml(text)}</span>`;
 }
 
-function stringToVibrantColor(str) {
+export function getMetaVibrantColor(str) {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     hash = str.charCodeAt(i) + ((hash << 5) - hash);
@@ -63,7 +63,7 @@ function applyMetaIconColors(container, itemSeed = "") {
     const seed =
       `${itemSeed}-${icon.closest("span")?.className || ""}-${cls}-${index}`;
 
-    icon.style.color = stringToVibrantColor(seed);
+    icon.style.color = getMetaVibrantColor(seed);
   });
 }
 

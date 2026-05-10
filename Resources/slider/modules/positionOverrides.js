@@ -6,8 +6,7 @@ let applyHomeTop = null;
 let applySkinHeader = null;
 let homeTopLifecycleBound = false;
 let skinHeaderLifecycleBound = false;
-const homeTopHeaderBaselineByElement = new WeakMap();
-const HOME_HEADER_OFFSET_VAR = '--jms-home-sections-header-offset-vh';
+const SLIDER_HEADER_OFFSET_VAR = '--jms-slider-header-offset-px';
 
 const OBSERVER_OPTIONS = {
   subtree: true,
@@ -144,10 +143,6 @@ function usesDynamicHeaderAdjustedTop(variant) {
   return variant === 'normalslider' || variant === 'peakslider' || variant === 'slider';
 }
 
-function getHeaderViewportBucket() {
-  return window.matchMedia?.('(max-width: 768px)')?.matches ? 'mobile' : 'desktop';
-}
-
 function isElementVisible(element) {
   if (!element?.isConnected) return false;
   const rect = element.getBoundingClientRect?.();
@@ -164,81 +159,49 @@ function findVisibleSkinHeader() {
   return null;
 }
 
-function computeHeaderHeightOffsetPx(header) {
-  const rect = header?.getBoundingClientRect?.();
-  const currentHeight = Number(rect?.height || 0);
-  if (!Number.isFinite(currentHeight) || currentHeight <= 0) return 0;
-
-  const viewportBucket = getHeaderViewportBucket();
-  const baselineState = homeTopHeaderBaselineByElement.get(header) || {
-    mobile: null,
-    desktop: null,
-  };
-
-  const previousBaseline = baselineState[viewportBucket];
-  const nextBaseline = Number.isFinite(previousBaseline) && previousBaseline > 0
-    ? Math.min(previousBaseline, currentHeight)
-    : currentHeight;
-
-  baselineState[viewportBucket] = nextBaseline;
-  homeTopHeaderBaselineByElement.set(header, baselineState);
-
-  const offsetPx = currentHeight - nextBaseline;
-  return Math.abs(offsetPx) < 1 ? 0 : offsetPx;
-}
-
-function getHeaderHeightOffsetVh(variant) {
-  if (!usesDynamicHeaderAdjustedTop(variant)) return 0;
-  const header = findVisibleSkinHeader();
-  if (!header) return 0;
-
-  const offsetPx = computeHeaderHeightOffsetPx(header);
-  if (!offsetPx) return 0;
-
-  const viewportHeight =
-    Number(window.innerHeight) ||
-    Number(document.documentElement?.clientHeight) ||
-    0;
-
-  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return 0;
-  return Number(((offsetPx / viewportHeight) * 100).toFixed(3));
-}
-
-function setHomeHeaderOffsetVar(offsetVh = 0) {
-  const root = document.documentElement;
-  if (!root?.style) return;
-  const numericOffset = Number.isFinite(offsetVh) ? offsetVh : 0;
-  const value = `${numericOffset}vh`;
-  if (root.style.getPropertyValue(HOME_HEADER_OFFSET_VAR) !== value) {
-    root.style.setProperty(HOME_HEADER_OFFSET_VAR, value);
+function getHomeTopTargets(affectFavoritesTab = true) {
+  const targets = [...document.querySelectorAll('.homeSectionsContainer')]
+    .filter(el => affectFavoritesTab || el?.id !== 'favoritesTab');
+  if (affectFavoritesTab) {
+    const fav = document.querySelector('#favoritesTab');
+    if (fav && !targets.includes(fav)) targets.push(fav);
   }
+  return targets;
+}
+
+function findRepresentativeHomeTopTarget(affectFavoritesTab = true) {
+  const visibleTargets = getHomeTopTargets(affectFavoritesTab)
+    .filter(isElementVisible)
+    .sort((a, b) => {
+      const topA = Number(a.getBoundingClientRect?.().top || 0);
+      const topB = Number(b.getBoundingClientRect?.().top || 0);
+      return topA - topB;
+    });
+
+  if (visibleTargets.length) return visibleTargets[0];
+  return getHomeTopTargets(affectFavoritesTab)[0] || null;
 }
 
 function computeEffectiveTopState() {
   const cfg = (typeof getConfig === 'function') ? getConfig() : {};
   const userTop = readUserTopFromLocalStorage();
   if (userTop !== null) {
-    setHomeHeaderOffsetVar(0);
     return {
       topValue: `${userTop}vh`,
       usesHeaderOffset: false,
     };
   }
   if (cfg?.enableSlider === false || cfg?.enableSlider === 'false') {
-    setHomeHeaderOffsetVar(0);
     return null;
   }
 
   const variant = resolveConfiguredVariant(cfg);
   const baseTop = getDefaultTopByVariant(variant);
   const usesHeaderOffset = usesDynamicHeaderAdjustedTop(variant);
-  const headerOffsetVh = usesHeaderOffset ? getHeaderHeightOffsetVh(variant) : 0;
-
-  setHomeHeaderOffsetVar(headerOffsetVh);
 
   return {
     topValue: usesHeaderOffset
-      ? `calc(${baseTop}vh + var(${HOME_HEADER_OFFSET_VAR}, 0vh))`
+      ? `calc(${baseTop}vh + var(${SLIDER_HEADER_OFFSET_VAR}, 0px))`
       : `${baseTop}vh`,
     usesHeaderOffset,
   };
@@ -292,12 +255,7 @@ function shouldAffectFavoritesTab(cfg) {
 }
 
 function applyTopToElements(value, affectFavoritesTab = true) {
-  const targets = [...document.querySelectorAll('.homeSectionsContainer')]
-    .filter(el => affectFavoritesTab || el?.id !== 'favoritesTab');
-  if (affectFavoritesTab) {
-    const fav = document.querySelector('#favoritesTab');
-    if (fav && !targets.includes(fav)) targets.push(fav);
-  }
+  const targets = getHomeTopTargets(affectFavoritesTab);
   for (const el of targets) {
     if (!el) continue;
     if (el.style.top !== value) {
@@ -307,12 +265,7 @@ function applyTopToElements(value, affectFavoritesTab = true) {
 }
 
 function clearTopOverrides(affectFavoritesTab = true) {
-  const targets = [...document.querySelectorAll('.homeSectionsContainer')]
-    .filter(el => affectFavoritesTab || el?.id !== 'favoritesTab');
-  if (affectFavoritesTab) {
-    const fav = document.querySelector('#favoritesTab');
-    if (fav && !targets.includes(fav)) targets.push(fav);
-  }
+  const targets = getHomeTopTargets(affectFavoritesTab);
   for (const el of targets) {
     if (!el) continue;
     el.style.removeProperty('top');

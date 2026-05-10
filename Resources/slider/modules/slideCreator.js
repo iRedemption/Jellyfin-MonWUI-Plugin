@@ -805,9 +805,11 @@ async function createSlide(item, options = {}) {
   const providerContainer = createProviderContainer({ config, ProviderIds, RemoteTrailers, itemId, slide, item });
   const languageContainer = createLanguageContainer({ config, MediaStreams, itemType });
 
-  const metaContainer = createMetaContainer(
+  const metaColorSeed = String(
     item?.Id || item?.Name || item?.BackdropImageTags?.[0] || Date.now()
   );
+  slide.dataset.metaColorSeed = metaColorSeed;
+  const metaContainer = createMetaContainer(metaColorSeed);
   if (statusContainer) metaContainer.appendChild(statusContainer);
   if (ratingExists) metaContainer.appendChild(ratingContainer);
   if (languageContainer) metaContainer.appendChild(languageContainer);

@@ -1,14 +1,29 @@
 import { getConfig } from "./config.js";
 import { forceHomeSectionsTop } from './positionOverrides.js';
 
-const config = getConfig();
 const HEADER_OFFSET_VAR = '--jms-slider-header-offset-px';
-const sliderHeaderBaselineByElement = new WeakMap();
 
 let sliderHeaderResizeObserver = null;
 let sliderHeaderObservedEl = null;
 let sliderHeaderLifecycleBound = false;
 let sliderHeaderRafId = 0;
+let sliderHeaderMutationObserver = null;
+
+const SLIDER_HEADER_OBSERVER_OPTIONS = {
+  subtree: true,
+  childList: true,
+  attributes: true,
+  attributeFilter: ['class', 'style', 'hidden']
+};
+
+const SLIDER_HEADER_RELEVANT_SELECTOR = [
+  '.skinHeader',
+  '.mainDrawer',
+  '.mainDrawerButton',
+  '#indexPage',
+  '#homePage',
+  "[data-role='page']",
+].join(', ');
 
 function normalizeSliderVariant(value) {
   const variant = String(value ?? '').trim().toLowerCase();
@@ -33,14 +48,39 @@ function usesDynamicHeaderOffset(variant = getActiveSliderVariant()) {
   return variant === 'slider' || variant === 'normalslider' || variant === 'peakslider';
 }
 
-function getSliderViewportBucket() {
-  return window.matchMedia?.('(max-width: 768px)')?.matches ? 'mobile' : 'desktop';
-}
-
 function findActiveSlidesContainer() {
   return document.querySelector(
     '#indexPage:not(.hide) #monwui-slides-container, #homePage:not(.hide) #monwui-slides-container, #monwui-slides-container'
   );
+}
+
+function getActivePageScrollTop() {
+  const activePage = document.querySelector(
+    '#indexPage:not(.hide), #homePage:not(.hide), [data-role="page"]:not(.hide)'
+  );
+
+  const candidates = [
+    window.scrollY,
+    window.pageYOffset,
+    document.scrollingElement?.scrollTop,
+    document.documentElement?.scrollTop,
+    document.body?.scrollTop,
+    activePage?.scrollTop,
+  ];
+
+  let maxScrollTop = 0;
+  for (const value of candidates) {
+    const numericValue = Number(value);
+    if (Number.isFinite(numericValue) && numericValue > maxScrollTop) {
+      maxScrollTop = numericValue;
+    }
+  }
+
+  return maxScrollTop;
+}
+
+function isSliderContextNearTop(maxScrollTop = 24) {
+  return getActivePageScrollTop() <= maxScrollTop;
 }
 
 function isElementVisible(element) {
@@ -59,10 +99,26 @@ function findVisibleSkinHeader() {
   return null;
 }
 
+function readSliderHeaderOffsetPx(container) {
+  if (!container) return 0;
+  const rawValue =
+    container.style.getPropertyValue(HEADER_OFFSET_VAR) ||
+    window.getComputedStyle?.(container)?.getPropertyValue?.(HEADER_OFFSET_VAR) ||
+    '';
+  const numericValue = Number.parseFloat(rawValue);
+  return Number.isFinite(numericValue) ? numericValue : 0;
+}
+
 function setSliderHeaderOffsetVar(container, offsetPx) {
-  if (!container) return;
   const roundedOffset = Number.isFinite(offsetPx) ? Math.round(offsetPx) : 0;
   const value = `${roundedOffset}px`;
+
+  const rootStyle = document.documentElement?.style;
+  if (rootStyle && rootStyle.getPropertyValue(HEADER_OFFSET_VAR) !== value) {
+    rootStyle.setProperty(HEADER_OFFSET_VAR, value);
+  }
+
+  if (!container) return;
   if (container.style.getPropertyValue(HEADER_OFFSET_VAR) !== value) {
     container.style.setProperty(HEADER_OFFSET_VAR, value);
   }
@@ -74,6 +130,13 @@ function clearSliderHeaderObserver() {
   try { sliderHeaderResizeObserver.disconnect(); } catch {}
 }
 
+function reconnectSliderHeaderMutationObserver() {
+  const root = document.body || document.documentElement;
+  if (!sliderHeaderMutationObserver || !root || document.visibilityState === 'hidden') return;
+  try { sliderHeaderMutationObserver.disconnect(); } catch {}
+  try { sliderHeaderMutationObserver.observe(root, SLIDER_HEADER_OBSERVER_OPTIONS); } catch {}
+}
+
 function scheduleSliderHeaderOffsetSync() {
   if (sliderHeaderRafId) return;
   sliderHeaderRafId = requestAnimationFrame(() => {
@@ -82,19 +145,79 @@ function scheduleSliderHeaderOffsetSync() {
   });
 }
 
+function scheduleSliderHeaderOffsetBurst() {
+  const delays = [0, 60, 180, 420, 900];
+  for (const delay of delays) {
+    setTimeout(() => {
+      try { scheduleSliderHeaderOffsetSync(); } catch {}
+    }, delay);
+  }
+}
+
+function nodeMatchesSliderHeaderRelevantTarget(node) {
+  return !!node?.matches?.(SLIDER_HEADER_RELEVANT_SELECTOR);
+}
+
+function nodeContainsSliderHeaderRelevantTarget(node) {
+  return !!node?.querySelector?.(SLIDER_HEADER_RELEVANT_SELECTOR);
+}
+
+function shouldScheduleSliderHeaderSync(mutations = []) {
+  for (const mutation of mutations) {
+    if (mutation.type === 'attributes') {
+      if (nodeMatchesSliderHeaderRelevantTarget(mutation.target)) return true;
+      continue;
+    }
+
+    for (const node of mutation.addedNodes || []) {
+      if (nodeMatchesSliderHeaderRelevantTarget(node) || nodeContainsSliderHeaderRelevantTarget(node)) {
+        return true;
+      }
+    }
+
+    for (const node of mutation.removedNodes || []) {
+      if (nodeMatchesSliderHeaderRelevantTarget(node) || nodeContainsSliderHeaderRelevantTarget(node)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function bindSliderHeaderLifecycle() {
   if (sliderHeaderLifecycleBound) return;
   sliderHeaderLifecycleBound = true;
 
-  window.addEventListener('resize', scheduleSliderHeaderOffsetSync, { passive: true });
-  window.addEventListener('pageshow', scheduleSliderHeaderOffsetSync);
-  window.addEventListener('hashchange', scheduleSliderHeaderOffsetSync);
-  window.addEventListener('popstate', scheduleSliderHeaderOffsetSync);
+  window.addEventListener('resize', scheduleSliderHeaderOffsetBurst, { passive: true });
+  window.addEventListener('pageshow', scheduleSliderHeaderOffsetBurst);
+  window.addEventListener('load', scheduleSliderHeaderOffsetBurst);
+  window.addEventListener('hashchange', scheduleSliderHeaderOffsetBurst);
+  window.addEventListener('popstate', scheduleSliderHeaderOffsetBurst);
+  window.addEventListener('focus', scheduleSliderHeaderOffsetBurst);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'hidden') {
-      scheduleSliderHeaderOffsetSync();
+      scheduleSliderHeaderOffsetBurst();
+      reconnectSliderHeaderMutationObserver();
+      return;
     }
+    try { sliderHeaderMutationObserver?.disconnect(); } catch {}
   });
+
+  if (!sliderHeaderMutationObserver) {
+    sliderHeaderMutationObserver = new MutationObserver((mutations) => {
+      if (!shouldScheduleSliderHeaderSync(mutations)) return;
+      scheduleSliderHeaderOffsetBurst();
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scheduleSliderHeaderOffsetBurst, { once: true });
+  } else {
+    scheduleSliderHeaderOffsetBurst();
+  }
+
+  reconnectSliderHeaderMutationObserver();
 }
 
 function ensureSliderHeaderObserver(header) {
@@ -114,27 +237,20 @@ function ensureSliderHeaderObserver(header) {
   try { sliderHeaderResizeObserver.observe(header); } catch {}
 }
 
-function computeSliderHeaderOffsetPx(header) {
-  const rect = header?.getBoundingClientRect?.();
-  const currentHeight = Number(rect?.height || 0);
-  if (!Number.isFinite(currentHeight) || currentHeight <= 0) return 0;
+function computeSliderHeaderOffsetPx(header, container) {
+  const currentOffset = readSliderHeaderOffsetPx(container);
+  if (!isSliderContextNearTop()) return currentOffset;
 
-  const viewportBucket = getSliderViewportBucket();
-  const baselineState = sliderHeaderBaselineByElement.get(header) || {
-    mobile: null,
-    desktop: null,
-  };
+  const headerRect = header?.getBoundingClientRect?.();
+  const slideRect = container?.getBoundingClientRect?.();
+  const headerBottom = Number(headerRect?.bottom || 0);
+  const slideTop = Number(slideRect?.top || 0);
 
-  const previousBaseline = baselineState[viewportBucket];
-  const nextBaseline = Number.isFinite(previousBaseline) && previousBaseline > 0
-    ? Math.min(previousBaseline, currentHeight)
-    : currentHeight;
+  if (!Number.isFinite(headerBottom) || !Number.isFinite(slideTop)) return 0;
 
-  baselineState[viewportBucket] = nextBaseline;
-  sliderHeaderBaselineByElement.set(header, baselineState);
-
-  const offsetPx = currentHeight - nextBaseline;
-  return Math.abs(offsetPx) < 1 ? 0 : offsetPx;
+  const overlapPx = headerBottom - slideTop;
+  const nextOffset = Math.max(0, currentOffset + overlapPx);
+  return Math.abs(nextOffset) < 1 ? 0 : nextOffset;
 }
 
 function resolveTopStyleValue(prefix, rawTopValue, config = getConfig()) {
@@ -149,9 +265,11 @@ function resolveTopStyleValue(prefix, rawTopValue, config = getConfig()) {
 }
 
 export function syncSliderHeaderOffset(container = findActiveSlidesContainer()) {
+  bindSliderHeaderLifecycle();
   const variant = getActiveSliderVariant();
 
   if (!container || !usesDynamicHeaderOffset(variant)) {
+    document.documentElement?.style?.removeProperty(HEADER_OFFSET_VAR);
     if (container) {
       container.style.removeProperty(HEADER_OFFSET_VAR);
     }
@@ -165,19 +283,28 @@ export function syncSliderHeaderOffset(container = findActiveSlidesContainer()) 
   if (!header) {
     setSliderHeaderOffsetVar(container, 0);
     clearSliderHeaderObserver();
+    reconnectSliderHeaderMutationObserver();
     return;
   }
 
   ensureSliderHeaderObserver(header);
-  setSliderHeaderOffsetVar(container, computeSliderHeaderOffsetPx(header));
+  setSliderHeaderOffsetVar(container, computeSliderHeaderOffsetPx(header, container));
 }
 
 function setImportantStyle(element, property, value) {
   if (!element) return;
 
   if (value !== undefined && value !== null && value !== '') {
-    element.style.setProperty(property, value, 'important');
+    const nextValue = String(value);
+    if (
+      element.style.getPropertyValue(property) === nextValue &&
+      element.style.getPropertyPriority(property) === 'important'
+    ) {
+      return;
+    }
+    element.style.setProperty(property, nextValue, 'important');
   } else {
+    if (!element.style.getPropertyValue(property)) return;
     element.style.removeProperty(property);
   }
 }
@@ -215,8 +342,8 @@ export function updateSlidePosition() {
 
   const slidesContainer = document.querySelector("#monwui-slides-container");
   if (slidesContainer) {
-    syncSliderHeaderOffset(slidesContainer);
     applyContainerStyles(slidesContainer);
+    syncSliderHeaderOffset(slidesContainer);
   } else {
     clearSliderHeaderObserver();
   }

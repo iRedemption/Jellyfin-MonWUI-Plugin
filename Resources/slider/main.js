@@ -2051,6 +2051,7 @@ window.__jmsMusicSchedulerBooted = window.__jmsMusicSchedulerBooted || false;
 window.__jmsSliderBootToken = Number(window.__jmsSliderBootToken || 0);
 window.__jmsSlidesInitToken = Number(window.__jmsSlidesInitToken || 0);
 window.__jmsSliderResetToken = Number(window.__jmsSliderResetToken || 0);
+window.__jmsHomeInitPending = window.__jmsHomeInitPending || false;
 window.__jmsStartWhenAllReadyHandler = window.__jmsStartWhenAllReadyHandler || null;
 window.__jmsSliderIdleHandles = window.__jmsSliderIdleHandles || new Set();
 
@@ -3676,6 +3677,9 @@ function placeSlidesContainerAtTop(indexPage, container) {
   const anchorTop = resolveSlidesContainerTopAnchor(indexPage);
 
   if (anchorTop) {
+    if (container.parentElement === indexPage && container.nextElementSibling === anchorTop) {
+      return container;
+    }
     indexPage.insertBefore(container, anchorTop);
   } else if (indexPage.firstElementChild !== container) {
     if (indexPage.firstElementChild) {
@@ -4098,6 +4102,17 @@ function shouldRepairVisibleSliderOnRestore({ forcePrime = false } = {}) {
 }
 
 function scheduleVisibleSliderRestoreRepair(options = {}) {
+  if (window.__jmsHomeInitPending || window.__slidesInitRunning || window.sliderResetInProgress) return;
+
+  const totalSlides = Math.max(0, Number(window.__totalSlidesPlanned) || 0);
+  const createdSlides = Math.max(0, Number(window.__slidesCreated) || 0);
+  if (totalSlides > 0 && createdSlides < totalSlides) return;
+
+  const peakContainer = document.querySelector(
+    "#indexPage:not(.hide) #monwui-slides-container, #homePage:not(.hide) #monwui-slides-container"
+  );
+  if (getConfig()?.peakSlider && peakContainer && !peakContainer.classList.contains("peak-ready")) return;
+
   if (!shouldRepairVisibleSliderOnRestore(options)) return;
   scheduleVisibleSliderRepair(options);
 }
@@ -4905,6 +4920,7 @@ export async function slidesInit() {
     }
     window.sliderResetInProgress = false;
     window.__slidesInitRunning = false;
+    window.__jmsHomeInitPending = false;
   }
 }
 
@@ -5387,139 +5403,158 @@ function queueHomeSectionsBoot({
 
 function initializeSliderOnHome({ forceManagedSectionsBoot = false } = {}) {
   const start = async () => {
-    try { window.__jmsHomeTabPaused = false; } catch {}
-    homeSectionLog("initializeSliderOnHome:start", {
-      forceManagedSectionsBoot,
-    });
-    homeSectionTrace("initializeSliderOnHome:start", {
-      forceManagedSectionsBoot,
-      stack: new Error().stack?.split("\n").slice(0, 6).join("\n") || "",
-    });
-
-    await waitForManagedHomeSectionCleanup({ timeoutMs: 2500 });
-
-    if (!isSliderEnabled()) {
-      try {
-        cleanupSlider({
-          preserveHomeSections: true,
-          reason: "initializeSliderOnHome:slider-disabled",
-        });
-      } catch {}
-      try { stopSlideTimer?.(); } catch {}
-      try { clearCycleArm(); } catch {}
-      homeSectionWarn("initializeSliderOnHome:slider-disabled", {
-        forceManagedSectionsBoot,
-      });
-
-      queueHomeSectionsBoot({
-        delayMs: 500,
-        requireSliderDisabled: true,
-        forceManagedSections: false
-      });
-      scheduleManagedHomeSectionRecovery();
-
-      return;
-    }
-
-    const hasContainer = !!document.querySelector('#indexPage:not(.hide) #monwui-slides-container, #homePage:not(.hide) #monwui-slides-container');
-    const willEarlyReturn = (window.__initOnHomeOnce && hasContainer);
-
-    function bootPersonalRecsWires() {
-      if (window.__recsWiresBooted) return;
-      window.__recsWiresBooted = true;
-
-      const indexPage =
-        document.querySelector("#indexPage:not(.hide)") ||
-        document.querySelector("#homePage:not(.hide)");
-      if (!indexPage) return;
-
-      let __recsBooted = false;
-      const onAllReady = () => {
-        if (__recsBooted) return;
-        __recsBooted = true;
-        const cfg = (typeof getConfig === 'function' ? getConfig() : {}) || {};
-
-        try {
-          bootHomeSections(cfg);
-        } catch (e) {
-          console.warn("bootPersonalRecsWires onAllReady hata:", e);
-        }
-      };
-
-      document.addEventListener("jms:all-slides-ready", onAllReady, { once: true });
-      if (window.__totalSlidesPlanned > 0 && window.__slidesCreated >= window.__totalSlidesPlanned) {
-        onAllReady();
-      }
-      setTimeout(() => { if (!__recsBooted) onAllReady(); }, 5000);
-      document.addEventListener("jms:slide-enter", () => { onAllReady(); }, { once: true });
-      if (window.__jmsFirstSlideReady) {
-        idle(() => onAllReady());
-      } else {
-        document.addEventListener("jms:first-slide-ready", () => {
-          idle(() => onAllReady());
-        }, { once: true });
-      }
-    }
-
-    if (willEarlyReturn) {
-      homeSectionLog("initializeSliderOnHome:early-return", {
-        forceManagedSectionsBoot,
-        hasContainer,
-      });
-      bootPersonalRecsWires();
-      queueHomeSectionsBoot({
-        delayMs: 600,
-        forceManagedSections: true
-      });
-      scheduleManagedHomeSectionRecovery();
-      return;
-    }
-    window.__initOnHomeOnce = true;
-    const indexPage = document.querySelector("#indexPage:not(.hide)") || document.querySelector("#homePage:not(.hide)");
-    if (!indexPage) {
-      homeSectionWarn("initializeSliderOnHome:no-visible-index-page", {
-        forceManagedSectionsBoot,
-      });
-      return;
-    }
-
-    fullSliderReset({ reason: "initializeSliderOnHome:slider-enabled" });
-    bootPersonalRecsWires();
-    upsertSlidesContainerAtTop(indexPage);
-    const sc = indexPage.querySelector('#monwui-slides-container');
-    if (config.peakSlider && sc) {
-      sc.scrollLeft = 0;
-      sc.classList.remove('peak-ready');
-      sc.classList.add('peak-init');
-      try { delete sc.dataset.peakPrimed; } catch {}
-    }
-    forceHomeSectionsTop();
-    forceSkinHeaderPointerEvents();
     try {
-      updateSlidePosition();
-    } catch {}
-    ensureProgressBarExists();
-    const pb = document.querySelector(".monwui-slide-progress-bar");
-    if (pb) {
-      pb.style.opacity = "0";
-      pb.style.width = "0%";
-    }
-    (async () => {
-      try {
-        await waitAuthWarmupFallback(1000);
-      } catch {}
-      slidesInit();
-    })();
+      try { window.__jmsHomeTabPaused = false; } catch {}
+      homeSectionLog("initializeSliderOnHome:start", {
+        forceManagedSectionsBoot,
+      });
+      homeSectionTrace("initializeSliderOnHome:start", {
+        forceManagedSectionsBoot,
+        stack: new Error().stack?.split("\n").slice(0, 6).join("\n") || "",
+      });
 
-    queueHomeSectionsBoot({
-      delayMs: 1800,
-      forceManagedSections: forceManagedSectionsBoot
-    });
-    scheduleManagedHomeSectionRecovery();
-    homeSectionLog("initializeSliderOnHome:booted", {
-      forceManagedSectionsBoot,
-      indexPageId: indexPage.id,
-    });
+      await waitForManagedHomeSectionCleanup({ timeoutMs: 2500 });
+
+      if (window.__jmsHomeInitPending) {
+        homeSectionLog("initializeSliderOnHome:skip:pending", {
+          forceManagedSectionsBoot,
+          slidesInitRunning: !!window.__slidesInitRunning,
+          sliderResetInProgress: !!window.sliderResetInProgress,
+        });
+        return;
+      }
+
+      window.__jmsHomeInitPending = true;
+
+      if (!isSliderEnabled()) {
+        window.__jmsHomeInitPending = false;
+        try {
+          cleanupSlider({
+            preserveHomeSections: true,
+            reason: "initializeSliderOnHome:slider-disabled",
+          });
+        } catch {}
+        try { stopSlideTimer?.(); } catch {}
+        try { clearCycleArm(); } catch {}
+        homeSectionWarn("initializeSliderOnHome:slider-disabled", {
+          forceManagedSectionsBoot,
+        });
+
+        queueHomeSectionsBoot({
+          delayMs: 500,
+          requireSliderDisabled: true,
+          forceManagedSections: false
+        });
+        scheduleManagedHomeSectionRecovery();
+
+        return;
+      }
+
+      const hasContainer = !!document.querySelector('#indexPage:not(.hide) #monwui-slides-container, #homePage:not(.hide) #monwui-slides-container');
+      const willEarlyReturn = (window.__initOnHomeOnce && hasContainer);
+
+      function bootPersonalRecsWires() {
+        if (window.__recsWiresBooted) return;
+        window.__recsWiresBooted = true;
+
+        const indexPage =
+          document.querySelector("#indexPage:not(.hide)") ||
+          document.querySelector("#homePage:not(.hide)");
+        if (!indexPage) return;
+
+        let __recsBooted = false;
+        const onAllReady = () => {
+          if (__recsBooted) return;
+          __recsBooted = true;
+          const cfg = (typeof getConfig === 'function' ? getConfig() : {}) || {};
+
+          try {
+            bootHomeSections(cfg);
+          } catch (e) {
+            console.warn("bootPersonalRecsWires onAllReady hata:", e);
+          }
+        };
+
+        document.addEventListener("jms:all-slides-ready", onAllReady, { once: true });
+        if (window.__totalSlidesPlanned > 0 && window.__slidesCreated >= window.__totalSlidesPlanned) {
+          onAllReady();
+        }
+        setTimeout(() => { if (!__recsBooted) onAllReady(); }, 5000);
+        document.addEventListener("jms:slide-enter", () => { onAllReady(); }, { once: true });
+        if (window.__jmsFirstSlideReady) {
+          idle(() => onAllReady());
+        } else {
+          document.addEventListener("jms:first-slide-ready", () => {
+            idle(() => onAllReady());
+          }, { once: true });
+        }
+      }
+
+      if (willEarlyReturn) {
+        window.__jmsHomeInitPending = false;
+        homeSectionLog("initializeSliderOnHome:early-return", {
+          forceManagedSectionsBoot,
+          hasContainer,
+        });
+        bootPersonalRecsWires();
+        queueHomeSectionsBoot({
+          delayMs: 600,
+          forceManagedSections: true
+        });
+        scheduleManagedHomeSectionRecovery();
+        return;
+      }
+      window.__initOnHomeOnce = true;
+      const indexPage = document.querySelector("#indexPage:not(.hide)") || document.querySelector("#homePage:not(.hide)");
+      if (!indexPage) {
+        window.__jmsHomeInitPending = false;
+        homeSectionWarn("initializeSliderOnHome:no-visible-index-page", {
+          forceManagedSectionsBoot,
+        });
+        return;
+      }
+
+      fullSliderReset({ reason: "initializeSliderOnHome:slider-enabled" });
+      bootPersonalRecsWires();
+      upsertSlidesContainerAtTop(indexPage);
+      const sc = indexPage.querySelector('#monwui-slides-container');
+      if (config.peakSlider && sc) {
+        sc.scrollLeft = 0;
+        sc.classList.remove('peak-ready');
+        sc.classList.add('peak-init');
+        try { delete sc.dataset.peakPrimed; } catch {}
+      }
+      forceHomeSectionsTop();
+      forceSkinHeaderPointerEvents();
+      try {
+        updateSlidePosition();
+      } catch {}
+      ensureProgressBarExists();
+      const pb = document.querySelector(".monwui-slide-progress-bar");
+      if (pb) {
+        pb.style.opacity = "0";
+        pb.style.width = "0%";
+      }
+      (async () => {
+        try {
+          await waitAuthWarmupFallback(1000);
+        } catch {}
+        void slidesInit();
+      })();
+
+      queueHomeSectionsBoot({
+        delayMs: 1800,
+        forceManagedSections: forceManagedSectionsBoot
+      });
+      scheduleManagedHomeSectionRecovery();
+      homeSectionLog("initializeSliderOnHome:booted", {
+        forceManagedSectionsBoot,
+        indexPageId: indexPage.id,
+      });
+    } catch (error) {
+      window.__jmsHomeInitPending = false;
+      console.warn("initializeSliderOnHome hata:", error);
+    }
   };
 
   void start();
