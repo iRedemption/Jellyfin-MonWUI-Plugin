@@ -73,6 +73,8 @@ function showPlayNowSuccessNotification(duration = 3000) {
 
 let __parentalPinRuntimePromise = null;
 let __cinemaPreRollRuntimePromise = null;
+let __playNowInFlight = null;
+const PLAY_NOW_DEDUPE_MS = 2 * 60_000;
 
 function isCinemaPreRollRuntimeNeeded(source = null) {
   const liveConfig = source || (typeof getConfig === "function" ? getConfig() : null) || config || {};
@@ -1658,9 +1660,12 @@ export function goToDetailsPage(itemId) {
 
 const ITEM_FULL_FIELDS = [
   "Type","Name","SeriesId","SeriesName","ParentId","ParentIndexNumber","IndexNumber",
+  "MediaType","CollectionType","IsFolder",
   "Overview","Genres","RunTimeTicks","OfficialRating","ProductionYear",
   "CommunityRating","CriticRating",
   "ImageTags","BackdropImageTags","ParentBackdropImageTags","ParentBackdropItemId","SeriesBackdropImageTag","SeasonId",
+  "SeriesPrimaryImageTag","SeriesThumbImageTag","ParentPrimaryImageItemId","ParentPrimaryImageTag",
+  "ParentThumbItemId","ParentThumbImageTag",
   "UserData","MediaStreams","Series", "CollectionIds",
   "ProviderIds", "People", "RemoteTrailers", "Studios", "Taglines",
   "AlbumId", "Album", "AlbumArtist", "AlbumArtistId", "Artists", "ArtistId", "ArtistIds", "ArtistItems",
@@ -2401,7 +2406,23 @@ async function getBestEpisodeIdForSeason(seasonId, seriesId, userId) {
   return all[0]?.Id || null;
 }
 
+function getActivePlayNowInFlight(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id || !__playNowInFlight?.promise) return null;
+  if (__playNowInFlight.itemId !== id) return null;
+  if (Date.now() - Number(__playNowInFlight.startedAt || 0) > PLAY_NOW_DEDUPE_MS) {
+    __playNowInFlight = null;
+    return null;
+  }
+  return __playNowInFlight.promise;
+}
+
 export async function playNow(itemId) {
+  const playNowRequestId = String(itemId || "").trim();
+  const existingPlayNow = getActivePlayNowInFlight(playNowRequestId);
+  if (existingPlayNow) return existingPlayNow;
+
+  const playNowPromise = (async () => {
   try {
     setLastPlayNowBlockReason("");
     const self = getSessionInfo();
@@ -2448,6 +2469,7 @@ export async function playNow(itemId) {
 
     const type = String(item?.Type || "");
     const mediaType = String(item?.MediaType || "");
+    const collectionType = String(item?.CollectionType || item?.collectionType || "").trim().toLowerCase();
     const isMusicLeaf =
       type === "Audio" ||
       type === "MusicVideo" ||
@@ -2457,7 +2479,7 @@ export async function playNow(itemId) {
       type === "MusicAlbum" ||
       type === "MusicArtist" ||
       type === "Playlist" ||
-      type === "Folder";
+      (type === "Folder" && (collectionType === "music" || collectionType === "musicvideos" || collectionType === "audio"));
 
   if (isMusicLeaf || isMusicContainer) {
     const gmmp = await __getGmmp();
@@ -2535,11 +2557,22 @@ export async function playNow(itemId) {
       return false;
     }
 
+    try {
+      if (!__parentalPinRuntimePromise) {
+        __parentalPinRuntimePromise = import("../../../slider/modules/parentalPinRuntime.js");
+      }
+      const pinMod = await __parentalPinRuntimePromise;
+      pinMod?.armParentalPinNativePlaybackBypass?.(20_000);
+    } catch {}
+
     await __destroyGmmpBeforeVideoPlayNow().catch(() => false);
     const cinemaPreRollResult = await maybePlayCinemaPreRollSessionIfEnabled({ item }).catch((error) => {
       console.warn("[JMSFusion] Cinema pre-roll oynatimi atlandi:", error);
       return { played: false, reason: "error" };
     });
+    if (cinemaPreRollResult?.reason === "session-active") {
+      return false;
+    }
     if (cinemaPreRollResult?.played === true) {
       await armCinemaPreRollNativePlaybackBypassIfEnabled({
         itemId: normalizedItemId,
@@ -2603,6 +2636,23 @@ export async function playNow(itemId) {
     }
 
     return false;
+  }
+  })();
+
+  if (playNowRequestId) {
+    __playNowInFlight = {
+      itemId: playNowRequestId,
+      promise: playNowPromise,
+      startedAt: Date.now()
+    };
+  }
+
+  try {
+    return await playNowPromise;
+  } finally {
+    if (__playNowInFlight?.promise === playNowPromise) {
+      __playNowInFlight = null;
+    }
   }
 }
 

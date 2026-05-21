@@ -2320,7 +2320,6 @@ function injectOrUpdateModalStyle() {
       transform: scale(1.05);
     }
 
-    /* Trailer tip overlay */
     .video-preview-modal .trailer-tip {
       position: absolute;
       top: 11px;
@@ -2340,7 +2339,6 @@ function injectOrUpdateModalStyle() {
       opacity: 0;
     }
 
-    /* No trailer message */
     .video-preview-modal .no-trailer-message {
       position: absolute;
       top: 50%;
@@ -2363,7 +2361,6 @@ function injectOrUpdateModalStyle() {
       opacity: 0;
     }
 
-    /* YouTube touch shield */
     .video-preview-modal .yt-first-touch-shield {
       position: absolute;
       inset: 0;
@@ -2373,7 +2370,6 @@ function injectOrUpdateModalStyle() {
       touch-action: manipulation;
     }
 
-    /* Mobile responsive */
     @media (max-width: 750px) {
       .video-preview-modal .preview-close-mobile {
         display: flex;
@@ -2396,14 +2392,12 @@ function injectOrUpdateModalStyle() {
       }
     }
 
-    /* High DPI screens optimization */
     @media (-webkit-min-device-pixel-ratio: 2), (min-resolution: 192dpi) {
       .video-preview-modal {
         backdrop-filter: blur(16px) saturate(180%);
       }
     }
 
-    /* Reduced motion support */
     @media (prefers-reduced-motion: reduce) {
       .video-preview-modal,
       .video-preview-modal * {
@@ -2413,14 +2407,12 @@ function injectOrUpdateModalStyle() {
       }
     }
 
-    /* Performance optimizations */
     .video-preview-modal * {
       will-change: auto;
       -webkit-backface-visibility: visible;
       backface-visibility: visible;
     }
 
-    /* Content fade animations */
     .video-preview-modal .content-element {
       opacity: 1;
       transform: translateY(0);

@@ -5,6 +5,15 @@ import { applySettings } from "./applySettings.js";
 const config = getConfig();
 
 export function createPositionEditor(config, labels, section) {
+  function withPositionUnit(labelText, unit) {
+    const label = String(labelText || '').trim();
+    if (!label) return '';
+    if (/\([^)]*\)/.test(label)) {
+      return label.replace(/\([^)]*\)/, `(${unit})`);
+    }
+    return `${label} (${unit})`;
+  }
+
   function createSettingItem(labelText, configKey, cssProperty, placeholder, target = 'slides', containerType = '') {
     const container = document.createElement('div');
     container.className = 'position-item';
@@ -347,6 +356,21 @@ export function createPositionEditor(config, labels, section) {
   });
 }
 
+  function writeStyleValue(el, cssProperty, value, important = false) {
+    if (!el) return;
+
+    if (value === '') {
+      el.style.removeProperty(cssProperty);
+      return;
+    }
+
+    if (important) {
+      el.style.setProperty(cssProperty, value, 'important');
+    } else {
+      el.style.setProperty(cssProperty, value);
+    }
+  }
+
   function updateContainerStyle(target, containerType, cssProperty, newValue) {
   if (target === 'homeSections') {
     const elements = [
@@ -355,9 +379,7 @@ export function createPositionEditor(config, labels, section) {
     ];
 
     elements.forEach(el => {
-      if (el) {
-        el.style[cssProperty] = newValue === '' ? '' : `${newValue}vh`;
-      }
+      writeStyleValue(el, cssProperty, newValue === '' ? '' : `${newValue}vh`);
     });
    } else {
     const selector = containerType
@@ -369,8 +391,16 @@ export function createPositionEditor(config, labels, section) {
         : `.monwui-${containerType}-container`)
       : "#monwui-slides-container";
 
+    const isMainSlideTop = !containerType && target === 'slides' && cssProperty === 'top';
+    const unit = isMainSlideTop ? 'vh' : '%';
+
     document.querySelectorAll(selector).forEach(el => {
-      el.style[cssProperty] = newValue === '' ? '' : `${newValue}%`;
+      writeStyleValue(
+        el,
+        cssProperty,
+        newValue === '' ? '' : `${newValue}${unit}`,
+        isMainSlideTop
+      );
     });
   }
 }
@@ -421,7 +451,7 @@ export function createPositionEditor(config, labels, section) {
 
     section.appendChild(
       createSettingItem(
-        config.languageLabels.containerTop ?? 'Dikey Konum (%):',
+        withPositionUnit(config.languageLabels.containerTop, 'vh') || 'Dikey Konum (vh):',
         'slideTop',
         'top',
         config.languageLabels.placeholderText

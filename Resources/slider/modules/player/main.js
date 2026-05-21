@@ -1,6 +1,13 @@
 import { initPlayer, togglePlayerVisibility, isPlayerInitialized } from "./utils/mainIndex.js";
 import { musicPlayerState, saveUserSettings } from "./core/state.js";
-import { refreshPlaylist, playTrackById, playAlbumById } from "./core/playlist.js";
+import {
+  refreshPlaylist,
+  playTrackById,
+  playAlbumById,
+  playArtistById,
+  playPlaylistById,
+  playFolderById
+} from "./core/playlist.js";
 import { updateProgress, updateDuration } from "./player/progress.js";
 import { syncDbIncremental, syncDbFullscan } from "./ui/artistModal.js";
 import { loadJSMediaTags } from "./lyrics/id3Reader.js";
@@ -14,10 +21,19 @@ import { getEmbyHeaders, getSessionInfo } from "../../../Plugins/JMSFusion/runti
 import { applyHeaderIconButtonMode, findHeaderMountTarget, getHeaderMountWaitSelector } from "../headerCompat.js";
 
 export { isMobileDevice } from "../playerStyles.js";
+export {
+  playTrackById,
+  playAlbumById,
+  playArtistById,
+  playPlaylistById,
+  playFolderById
+};
 
 const config = getConfig();
 const GMMP_REMOTE_STATE_INTERVAL_MS = 4000;
 const GMMP_REMOTE_COMMAND_INTERVAL_MS = 2500;
+const GMMP_NATIVE_HOOK_SCAN_INTERVAL_MS = 2_000;
+const GMMP_NATIVE_HOOK_MAX_SCAN_MS = 5 * 60_000;
 
 let gmmpRemoteStateTimer = 0;
 let gmmpRemoteCommandTimer = 0;
@@ -26,7 +42,13 @@ let gmmpRemoteCommandBusy = false;
 let gmmpRemoteLastCommandSequence = 0;
 let gmmpRemoteLastStateSignature = "";
 let gmmpRemoteLifecycleHooksInstalled = false;
+let gmmpNativePlaybackHookInstalled = false;
+let gmmpNativePlaybackHookScanTimer = 0;
+let gmmpNativePlaybackHookScheduleTimer = 0;
+let gmmpNativePlaybackHookScanStartedAt = 0;
+let gmmpNativePlaybackHookBypassDepth = 0;
 let playerHeaderObserver = null;
+const gmmpNativePlaybackHookPatchedTargets = new WeakMap();
 const PLAYER_HEADER_LEGACY_CLASS = "headerSyncButton syncButton headerButton headerButtonRight paper-icon-button-light";
 
 function logGmmpRemote(message, detail = undefined, level = "info") {
@@ -597,6 +619,396 @@ export async function ensureGmmpInit({ show = true } = {}) {
   }
 }
 
+function firstNativePlaybackString(...values) {
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function getNativePlaybackItemId(item) {
+  return String(item?.Id || item?.id || item?.ItemId || item?.itemId || "").trim();
+}
+
+function getFirstNativePlaybackItem(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (Array.isArray(payload)) {
+    return payload.find((item) => item && typeof item === "object" && getNativePlaybackItemId(item)) || null;
+  }
+  if (payload.item && typeof payload.item === "object") return payload.item;
+  if (payload.Item && typeof payload.Item === "object") return payload.Item;
+  if (Array.isArray(payload.items)) return getFirstNativePlaybackItem(payload.items);
+  if (Array.isArray(payload.Items)) return getFirstNativePlaybackItem(payload.Items);
+  if (payload.Id || payload.id) return payload;
+  return null;
+}
+
+function getFirstNativePlaybackId(payload) {
+  if (!payload) return "";
+  if (typeof payload === "string") return payload.trim();
+  if (Array.isArray(payload)) {
+    for (const value of payload) {
+      const id = getFirstNativePlaybackId(value);
+      if (id) return id;
+    }
+    return "";
+  }
+  if (typeof payload !== "object") return "";
+
+  const item = getFirstNativePlaybackItem(payload);
+  const itemId = getNativePlaybackItemId(item);
+  if (itemId) return itemId;
+
+  const listKeys = ["ids", "Ids", "itemIds", "ItemIds", "ItemIdsList", "PlaylistItemIds"];
+  for (const key of listKeys) {
+    const value = payload[key];
+    if (Array.isArray(value) && value.length) {
+      const id = getFirstNativePlaybackId(value[0]) || firstNativePlaybackString(value[0]);
+      if (id) return id;
+    }
+  }
+
+  return firstNativePlaybackString(
+    payload.itemId,
+    payload.ItemId,
+    payload.id,
+    payload.Id,
+    payload.mediaSourceId,
+    payload.MediaSourceId
+  );
+}
+
+function extractGmmpNativePlaybackContext(args = []) {
+  const list = Array.isArray(args) ? args : [];
+  for (const arg of list) {
+    const item = getFirstNativePlaybackItem(arg);
+    const itemId = getFirstNativePlaybackId(arg);
+    if (item || itemId) {
+      return {
+        item,
+        itemId: itemId || getNativePlaybackItemId(item)
+      };
+    }
+  }
+  return { item: null, itemId: "" };
+}
+
+function isMusicNativePlaybackItem(item) {
+  const type = String(item?.Type || "");
+  const mediaType = String(item?.MediaType || "");
+  const collectionType = String(item?.CollectionType || item?.collectionType || "").trim().toLowerCase();
+
+  if (mediaType === "Audio") return true;
+  if (type === "Audio" || type === "MusicVideo" || type === "MusicAlbum" || type === "MusicArtist") return true;
+  if (type === "Playlist") return true;
+  if (type === "Folder" && (collectionType === "music" || collectionType === "musicvideos" || collectionType === "audio")) return true;
+  return false;
+}
+
+async function fetchGmmpNativePlaybackItemDetails(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id) return null;
+
+  try {
+    const api = await import("../../../Plugins/JMSFusion/runtime/api.js");
+    if (typeof api?.fetchItemDetails === "function") {
+      return await api.fetchItemDetails(id);
+    }
+  } catch (error) {
+    console.warn("[GMMP] Native music item lookup failed:", error);
+  }
+
+  return null;
+}
+
+async function resolveGmmpNativePlaybackItem(context = {}) {
+  const candidate = context?.item;
+  if (candidate?.Type && getNativePlaybackItemId(candidate)) return candidate;
+
+  const itemId = context?.itemId || getNativePlaybackItemId(candidate);
+  if (!itemId) return candidate || null;
+  if (candidate && getNativePlaybackItemId(candidate)) return candidate;
+
+  const fetched = await fetchGmmpNativePlaybackItemDetails(itemId);
+  if (fetched) return fetched;
+  return candidate || { Id: itemId };
+}
+
+async function playNativeMusicItemWithGmmp(item, itemId) {
+  if (!isGmmpEnabled()) return false;
+
+  const id = String(itemId || getNativePlaybackItemId(item) || "").trim();
+  if (!id) return false;
+
+  const type = String(item?.Type || "");
+  const mediaType = String(item?.MediaType || "");
+
+  if (type === "Audio" || type === "MusicVideo" || mediaType === "Audio") {
+    return !!(await playTrackById(id, { revealPlayer: true }).catch(() => false));
+  }
+  if (type === "MusicAlbum") {
+    return !!(await playAlbumById(id, { revealPlayer: true }).catch(() => false));
+  }
+  if (type === "MusicArtist") {
+    return !!(await playArtistById(id, { revealPlayer: true }).catch(() => false));
+  }
+  if (type === "Playlist") {
+    return !!(await playPlaylistById(id, { revealPlayer: true }).catch(() => false));
+  }
+  if (type === "Folder") {
+    return !!(await playFolderById(id, { revealPlayer: true }).catch(() => false));
+  }
+
+  return false;
+}
+
+function callOriginalGmmpNativePlay(original, target, args) {
+  gmmpNativePlaybackHookBypassDepth += 1;
+  try {
+    return original.apply(target, args);
+  } finally {
+    gmmpNativePlaybackHookBypassDepth = Math.max(0, gmmpNativePlaybackHookBypassDepth - 1);
+  }
+}
+
+async function runGmmpBeforeNativePlay(original, target, args, label) {
+  if (gmmpNativePlaybackHookBypassDepth > 0) {
+    return callOriginalGmmpNativePlay(original, target, args);
+  }
+
+  const context = extractGmmpNativePlaybackContext(args);
+  const itemId = context.itemId || getNativePlaybackItemId(context.item);
+  if (!itemId) {
+    return callOriginalGmmpNativePlay(original, target, args);
+  }
+
+  const item = await resolveGmmpNativePlaybackItem(context);
+  if (!isMusicNativePlaybackItem(item)) {
+    return callOriginalGmmpNativePlay(original, target, args);
+  }
+
+  const handled = await playNativeMusicItemWithGmmp(item, itemId);
+  if (handled) return true;
+
+  return callOriginalGmmpNativePlay(original, target, args);
+}
+
+function getWebpackRequireForGmmpNativeHook() {
+  try {
+    if (window.__jmsGmmpWebpackRequire) return window.__jmsGmmpWebpackRequire;
+  } catch {}
+
+  const chunkGlobals = [];
+  try {
+    if (Array.isArray(window.webpackChunk)) chunkGlobals.push(window.webpackChunk);
+  } catch {}
+  try {
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (!/^webpackChunk/i.test(key)) continue;
+      const value = window[key];
+      if (Array.isArray(value) && !chunkGlobals.includes(value)) chunkGlobals.push(value);
+    }
+  } catch {}
+
+  for (const chunkGlobal of chunkGlobals) {
+    try {
+      let captured = null;
+      const chunkId = `jms-gmmp-native-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      chunkGlobal.push([[chunkId], {}, (req) => {
+        captured = req;
+      }]);
+      if (typeof captured === "function") {
+        try { window.__jmsGmmpWebpackRequire = captured; } catch {}
+        return captured;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function collectWebpackPlaybackManagersForGmmpHook() {
+  const req = getWebpackRequireForGmmpNativeHook();
+  if (!req) return [];
+
+  const out = [];
+  const add = (candidate, label) => {
+    if (!candidate || typeof candidate.play !== "function") return;
+    out.push({ target: candidate, label });
+  };
+
+  try {
+    const direct = req(39738);
+    add(direct?.f, "webpack:39738");
+  } catch {}
+
+  try {
+    if (req.c) {
+      for (const [moduleId, mod] of Object.entries(req.c)) {
+        const candidate = mod?.exports?.f;
+        if (candidate?.play && candidate?.canPlay && candidate?.getCurrentPlayer) {
+          add(candidate, `webpack:${moduleId}`);
+        }
+      }
+    }
+  } catch {}
+
+  return out;
+}
+
+function collectNativePlaybackManagersForGmmpHook() {
+  const out = [];
+  const seen = new Set();
+  const add = (candidate, label) => {
+    if (!candidate || (typeof candidate !== "object" && typeof candidate !== "function")) return;
+    if (typeof candidate.play !== "function") return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    out.push({ target: candidate, label });
+  };
+
+  [
+    [window.playbackManager, "window.playbackManager"],
+    [window.MediaBrowser?.playbackManager, "MediaBrowser.playbackManager"],
+    [window.MediaBrowser?.PlaybackManager, "MediaBrowser.PlaybackManager"],
+    [window.Emby?.playbackManager, "Emby.playbackManager"],
+    [window.Emby?.PlaybackManager, "Emby.PlaybackManager"],
+    [window.appRouter?.playbackManager, "appRouter.playbackManager"],
+    [window.__playbackManager, "__playbackManager"],
+    [window.__jellyfinPlaybackManager, "__jellyfinPlaybackManager"],
+    [window.__jmsPlaybackManager, "__jmsPlaybackManager"]
+  ].forEach(([candidate, label]) => add(candidate, label));
+
+  try {
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (!/playback/i.test(key)) continue;
+      try { add(window[key], `window.${key}`); } catch {}
+    }
+  } catch {}
+
+  for (const candidate of collectWebpackPlaybackManagersForGmmpHook()) {
+    add(candidate.target, candidate.label);
+  }
+
+  return out;
+}
+
+function patchNativePlaybackManagerForGmmp(target, label) {
+  if (!target || typeof target.play !== "function") return false;
+
+  const currentPlay = target.play;
+  if (currentPlay?.__jmsGmmpNativeWrapped === true) {
+    gmmpNativePlaybackHookPatchedTargets.set(target, currentPlay);
+    return false;
+  }
+
+  const knownWrapped = gmmpNativePlaybackHookPatchedTargets.get(target);
+  if (knownWrapped && currentPlay === knownWrapped) return false;
+
+  const wrapped = function gmmpWrappedNativePlay(...args) {
+    return runGmmpBeforeNativePlay(currentPlay, this || target, args, label);
+  };
+
+  try {
+    Object.defineProperty(wrapped, "__jmsGmmpNativeWrapped", { value: true });
+    Object.defineProperty(wrapped, "__jmsGmmpNativeOriginalPlay", { value: currentPlay });
+    Object.defineProperty(wrapped, "__jmsGmmpNativePlayLabel", { value: label });
+    target.play = wrapped;
+    gmmpNativePlaybackHookPatchedTargets.set(target, wrapped);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function patchKnownNativePlaybackManagersForGmmp() {
+  if (typeof window === "undefined") return false;
+
+  let patchedAny = false;
+  for (const { target, label } of collectNativePlaybackManagersForGmmpHook()) {
+    patchedAny = patchNativePlaybackManagerForGmmp(target, label) || patchedAny;
+  }
+  return patchedAny;
+}
+
+function installGmmpNativePlaybackHook() {
+  if (
+    gmmpNativePlaybackHookInstalled ||
+    !isGmmpEnabled() ||
+    typeof window === "undefined" ||
+    typeof document === "undefined"
+  ) return;
+
+  gmmpNativePlaybackHookInstalled = true;
+  gmmpNativePlaybackHookScanStartedAt = Date.now();
+
+  const scan = () => {
+    patchKnownNativePlaybackManagersForGmmp();
+    if (
+      gmmpNativePlaybackHookScanTimer &&
+      Date.now() - gmmpNativePlaybackHookScanStartedAt > GMMP_NATIVE_HOOK_MAX_SCAN_MS
+    ) {
+      window.clearInterval(gmmpNativePlaybackHookScanTimer);
+      gmmpNativePlaybackHookScanTimer = 0;
+    }
+  };
+
+  scan();
+  gmmpNativePlaybackHookScanTimer = window.setInterval(scan, GMMP_NATIVE_HOOK_SCAN_INTERVAL_MS);
+  window.addEventListener("pageshow", scan, { passive: true });
+  window.addEventListener("focus", scan, { passive: true });
+}
+
+function isAndroidWebViewLike() {
+  try {
+    const ua = String(navigator?.userAgent || "");
+    return /Android/i.test(ua) && (
+      /\bwv\b/i.test(ua) ||
+      /; wv\)/i.test(ua) ||
+      /Jellyfin/i.test(ua) ||
+      !!window.ReactNativeWebView
+    );
+  } catch {
+    return false;
+  }
+}
+
+function scheduleGmmpNativePlaybackHook() {
+  if (
+    gmmpNativePlaybackHookInstalled ||
+    gmmpNativePlaybackHookScheduleTimer ||
+    !isGmmpEnabled() ||
+    typeof window === "undefined" ||
+    typeof document === "undefined"
+  ) return;
+
+  const delayMs = isAndroidWebViewLike() ? 3500 : 750;
+  const run = () => {
+    gmmpNativePlaybackHookScheduleTimer = 0;
+    if (!isGmmpEnabled()) return;
+
+    const install = () => installGmmpNativePlaybackHook();
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(install, { timeout: 2000 });
+    } else {
+      install();
+    }
+  };
+
+  const arm = () => {
+    if (gmmpNativePlaybackHookInstalled || gmmpNativePlaybackHookScheduleTimer || !isGmmpEnabled()) return;
+    gmmpNativePlaybackHookScheduleTimer = window.setTimeout(run, delayMs);
+  };
+
+  if (document.readyState === "complete") {
+    arm();
+  } else {
+    window.addEventListener("load", arm, { once: true, passive: true });
+    window.setTimeout(arm, isAndroidWebViewLike() ? 9000 : 5000);
+  }
+}
+
 export async function destroyGmmp({ reason = "manual" } = {}) {
   try {
     const [
@@ -990,10 +1402,12 @@ if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => {
     forceSkinHeaderPointerEvents();
     addPlayerButton();
+    scheduleGmmpNativePlaybackHook();
   }, { once: true });
 } else {
   forceSkinHeaderPointerEvents();
   addPlayerButton();
+  scheduleGmmpNativePlaybackHook();
 }
 
 
@@ -1002,8 +1416,12 @@ if (typeof window !== "undefined") {
   Object.assign(window.__GMMP, {
     playTrackById,
     playAlbumById,
+    playArtistById,
+    playPlaylistById,
+    playFolderById,
     ensureInit: ensureGmmpInit,
     destroy: destroyGmmp,
+    installNativePlaybackHook: scheduleGmmpNativePlaybackHook,
     getPlaybackState: getGmmpPlaybackState,
     setPaused: setGmmpPaused,
     setMuted: setGmmpMuted,

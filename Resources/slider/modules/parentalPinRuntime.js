@@ -1,4 +1,4 @@
-import { getConfig } from "./config.js";
+import { getConfig, isParentalPinModuleEnabled } from "./config.js";
 import { getDefaultLanguage, getLanguageLabels } from "../language/index.js";
 import {
   fetchCurrentUserParentalPinPolicy,
@@ -44,7 +44,19 @@ const NATIVE_NON_PLAY_ACTIONS = new Set([
   "markplayed",
   "markunplayed",
   "watched",
-  "unwatched"
+  "unwatched",
+  "link",
+  "none",
+  "details",
+  "itemdetails",
+  "info",
+  "edit",
+  "delete",
+  "remove",
+  "shuffle",
+  "instantmix",
+  "addtoplaylist",
+  "queueallfromhere"
 ]);
 const NATIVE_NON_PLAY_ICON_TEXTS = new Set([
   "favorite",
@@ -86,6 +98,15 @@ const NATIVE_MENU_ICON_TEXTS = new Set([
   "arrow_drop_down"
 ]);
 let nativePlayInterceptorInstalled = false;
+let nativePlaybackHookInstalled = false;
+let nativePlaybackHookScanTimer = 0;
+let nativePlaybackHookScanStartedAt = 0;
+let nativePlaybackHookBypassDepth = 0;
+let nativePlaybackHookBypassUntil = 0;
+const nativePlaybackHookPatchedTargets = new WeakSet();
+const NATIVE_HOOK_SCAN_INTERVAL_MS = 2_000;
+const NATIVE_HOOK_MAX_SCAN_MS = 5 * 60_000;
+const NATIVE_PLAYBACK_CHAIN_BYPASS_MS = 12_000;
 let activePromptPromise = null;
 let lastKnownPolicy = null;
 let lastNativePlayContext = {
@@ -834,14 +855,55 @@ function collectEventElements(event) {
   return out;
 }
 
-function hasNativePlayIcon(element) {
+function isPrimaryNativePlayActivationEvent(event) {
+  if (!event) return false;
+
+  const type = String(event.type || "").toLowerCase();
+  if (type === "keydown") {
+    return event.key === "Enter" || event.key === " ";
+  }
+  if (type === "touchstart" || type === "pointerdown" || type === "mousedown") {
+    return false;
+  }
+
+  const button = Number(event.button);
+  if (Number.isFinite(button) && button !== 0) {
+    return false;
+  }
+
+  const which = Number(event.which);
+  if (Number.isFinite(which) && which > 1) {
+    return false;
+  }
+
+  const buttons = Number(event.buttons);
+  if (
+    (type === "pointerdown" || type === "mousedown") &&
+    Number.isFinite(buttons) &&
+    buttons > 0 &&
+    buttons !== 1
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function hasNativePlayIcon(element, { includeDescendants = true } = {}) {
   if (!element) return false;
 
-  const iconTexts = [
+  const iconSources = [
     element.getAttribute?.("icon"),
     element.dataset?.icon,
     element.querySelector?.(".material-icons, .md-icon, .cardOverlayButtonIcon")?.textContent
-  ]
+  ];
+  if (includeDescendants) {
+    iconSources.push(
+      element.querySelector?.(".listItemImageButton .material-icons, .cardOverlayButton .material-icons")?.textContent
+    );
+  }
+
+  const iconTexts = iconSources
     .map(normalizeActionText)
     .filter(Boolean);
 
@@ -851,10 +913,50 @@ function hasNativePlayIcon(element) {
 
   const classBlob = [
     String(element.className || ""),
-    String(element.querySelector?.(".material-icons, .md-icon, .cardOverlayButtonIcon")?.className || "")
+    includeDescendants
+      ? String(element.querySelector?.(".material-icons, .md-icon, .cardOverlayButtonIcon")?.className || "")
+      : ""
   ].join(" ");
 
   return /\b(play_arrow|play_circle|play-circle|fa-play|fa-circle-play|fa-play-circle)\b/i.test(classBlob);
+}
+
+function resolveExplicitListItemPlayControl(element) {
+  return element?.closest?.([
+    ".listItemImageButton[data-action=\"play\"]",
+    ".listItemImageButton[data-action=\"resume\"]",
+    "[data-action=\"play\"].listItemImageButton",
+    "[data-action=\"resume\"].listItemImageButton",
+    ".listItemImage[data-action=\"play\"]",
+    ".listItemImage[data-action=\"resume\"]"
+  ].join(", ")) || null;
+}
+
+function isListItemNavigationTarget(element) {
+  const row = element?.closest?.(".listItem");
+  if (!row) return false;
+  if (resolveExplicitListItemPlayControl(element)) return false;
+
+  const action = normalizeActionText(
+    element?.getAttribute?.("data-action") ||
+    element?.dataset?.action ||
+    row.getAttribute?.("data-action") ||
+    row.dataset?.action ||
+    ""
+  ).replace(/\s+/g, "");
+  if (action && (NATIVE_NON_PLAY_ACTIONS.has(action) || NATIVE_MENU_ACTIONS.has(action))) {
+    return true;
+  }
+
+  if (element?.closest?.(".listViewUserDataButtons, .listItem-bottomoverview")) {
+    return true;
+  }
+
+  if (element?.closest?.(".listItemBody, .listItem-overview, .listItem-content")) {
+    return !element?.closest?.(".listItemImageButton");
+  }
+
+  return false;
 }
 
 function hasExplicitNonPlayIcon(element) {
@@ -1028,15 +1130,19 @@ function isNativePlayActionElement(element) {
     return true;
   }
 
+  if (/\blistItem\b/i.test(className)) {
+    return !!resolveExplicitListItemPlayControl(element);
+  }
+
   if (!isLikelyInteractiveActionElement(element)) {
     return false;
   }
 
   return (
-    hasNativePlayIcon(element) &&
+    hasNativePlayIcon(element, { includeDescendants: !/\blistItem\b/i.test(className) }) &&
     (
       isActionSheetElement(element) ||
-      /\b(cardOverlayButton|itemAction|paper-icon-button-light|listItem|actionSheetMenuItem)\b/i.test(className)
+      /\b(cardOverlayButton|itemAction|paper-icon-button-light|actionSheetMenuItem)\b/i.test(className)
     )
   );
 }
@@ -1075,12 +1181,15 @@ function resolveNativePlayButton(target) {
     "[data-action=\"resume\"]",
     "[data-action=\"playallfromhere\"]",
     ".btnPlay",
-    ".btnResume"
+    ".btnResume",
+    ".listItemImageButton[data-action=\"play\"]",
+    ".listItemImageButton[data-action=\"resume\"]"
   ].join(", ")));
+
+  add(resolveExplicitListItemPlayControl(target));
 
   add(target?.closest?.([
     ".itemAction",
-    ".listItem",
     ".actionSheetMenuItem",
     ".actionSheetItem",
     ".actionSheet .listItem",
@@ -1127,6 +1236,10 @@ function resolveAudioListPlayAllFromHereElement(target) {
 
 function resolveNativePlayButtonFromEvent(event) {
   for (const element of collectEventElements(event)) {
+    if (isListItemNavigationTarget(element)) {
+      return null;
+    }
+
     const audioListRow = resolveAudioListPlayAllFromHereElement(element);
     if (audioListRow && !shouldIgnoreNativePlayInterception(audioListRow)) {
       return audioListRow;
@@ -1275,6 +1388,465 @@ function rememberNativePlayContextFromEvent(event) {
   return "";
 }
 
+function firstString(...values) {
+  for (const value of values) {
+    const text = String(value || "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function getPlaybackItemId(item) {
+  return String(item?.Id || item?.id || item?.ItemId || item?.itemId || "").trim();
+}
+
+function isMusicPlaybackItem(item) {
+  const type = String(item?.Type || "");
+  const mediaType = String(item?.MediaType || "");
+  const collectionType = String(item?.CollectionType || item?.collectionType || "").trim().toLowerCase();
+
+  if (mediaType === "Audio") return true;
+  if (type === "Audio" || type === "MusicVideo" || type === "MusicAlbum" || type === "MusicArtist") return true;
+  if (type === "Playlist") return true;
+  if (type === "Folder" && (collectionType === "music" || collectionType === "musicvideos" || collectionType === "audio")) return true;
+  return false;
+}
+
+function getElementPlaybackTypeHint(element) {
+  if (!element) return { type: "", mediaType: "", collectionType: "" };
+
+  const lineage = [];
+  let current = element;
+  let depth = 0;
+  while (current && depth < 12) {
+    lineage.push(current);
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  const read = (node, names) => {
+    for (const name of names) {
+      const value =
+        node?.getAttribute?.(name) ||
+        node?.dataset?.[name.replace(/^data-/, "").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] ||
+        "";
+      const normalized = String(value || "").trim();
+      if (normalized) return normalized;
+    }
+    return "";
+  };
+
+  const hint = { type: "", mediaType: "", collectionType: "" };
+  for (const node of lineage) {
+    hint.type ||= read(node, ["data-type", "itemtype", "data-itemtype"]);
+    hint.mediaType ||= read(node, ["data-mediatype", "data-media-type", "mediatype"]);
+    hint.collectionType ||= read(node, ["data-collectiontype", "data-collection-type", "collectiontype"]);
+    if (hint.type && hint.mediaType && hint.collectionType) break;
+  }
+
+  return hint;
+}
+
+function isKnownMusicPlaybackElement(element) {
+  const hint = getElementPlaybackTypeHint(element);
+  return isMusicPlaybackItem({
+    Type: hint.type,
+    MediaType: hint.mediaType,
+    CollectionType: hint.collectionType
+  });
+}
+
+async function tryRouteMusicPlaybackToGmmp(item, itemId) {
+  const cfg = getConfig?.() || {};
+  if (cfg.enabledGmmp === false) return false;
+
+  try {
+    const gmmp = await import("./player/main.js");
+    await gmmp?.ensureGmmpInit?.({ show: true }).catch(() => false);
+
+    const id = String(itemId || getPlaybackItemId(item) || "").trim();
+    const type = String(item?.Type || "");
+    const mediaType = String(item?.MediaType || "");
+    if (!id) return false;
+
+    if (type === "Audio" || type === "MusicVideo" || mediaType === "Audio") {
+      return !!(await gmmp?.playTrackById?.(id, { revealPlayer: true }).catch(() => false));
+    }
+    if (type === "MusicAlbum") {
+      return !!(await gmmp?.playAlbumById?.(id, { revealPlayer: true }).catch(() => false));
+    }
+    if (type === "MusicArtist") {
+      return !!(await gmmp?.playArtistById?.(id, { revealPlayer: true }).catch(() => false));
+    }
+    if (type === "Playlist") {
+      return !!(await gmmp?.playPlaylistById?.(id, { revealPlayer: true }).catch(() => false));
+    }
+    if (type === "Folder") {
+      return !!(await gmmp?.playFolderById?.(id, { revealPlayer: true }).catch(() => false));
+    }
+  } catch (error) {
+    console.warn("[JMSFusion] GMMP music route failed:", error);
+  }
+
+  return false;
+}
+
+function getFirstNativePlaybackItem(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (Array.isArray(payload)) {
+    return payload.find((entry) => entry && typeof entry === "object" && getPlaybackItemId(entry)) || null;
+  }
+  if (payload.item && typeof payload.item === "object") return payload.item;
+  if (payload.Item && typeof payload.Item === "object") return payload.Item;
+  if (Array.isArray(payload.items)) return getFirstNativePlaybackItem(payload.items);
+  if (Array.isArray(payload.Items)) return getFirstNativePlaybackItem(payload.Items);
+  if (payload.Id || payload.id) return payload;
+  return null;
+}
+
+function getFirstNativePlaybackId(payload) {
+  if (!payload) return "";
+  if (typeof payload === "string") return payload.trim();
+  if (Array.isArray(payload)) {
+    for (const value of payload) {
+      const id = getFirstNativePlaybackId(value);
+      if (id) return id;
+    }
+    return "";
+  }
+  if (typeof payload !== "object") return "";
+
+  const item = getFirstNativePlaybackItem(payload);
+  const itemId = getPlaybackItemId(item);
+  if (itemId) return itemId;
+
+  const listKeys = ["ids", "Ids", "itemIds", "ItemIds", "ItemIdsList", "PlaylistItemIds"];
+  for (const key of listKeys) {
+    const value = payload[key];
+    if (Array.isArray(value) && value.length) {
+      const id = getFirstNativePlaybackId(value[0]) || firstString(value[0]);
+      if (id) return id;
+    }
+  }
+
+  return firstString(
+    payload.itemId,
+    payload.ItemId,
+    payload.id,
+    payload.Id,
+    payload.mediaSourceId,
+    payload.MediaSourceId
+  );
+}
+
+function extractNativePlaybackContext(args = []) {
+  const list = Array.isArray(args) ? args : [];
+  for (const arg of list) {
+    const item = getFirstNativePlaybackItem(arg);
+    const itemId = getFirstNativePlaybackId(arg);
+    if (item || itemId) {
+      return {
+        item,
+        itemId: itemId || getPlaybackItemId(item)
+      };
+    }
+  }
+  return { item: null, itemId: "" };
+}
+
+function getWebpackRequireForParentalPinHook() {
+  try {
+    if (window.__jmsParentalPinWebpackRequire) return window.__jmsParentalPinWebpackRequire;
+  } catch {}
+
+  const chunkGlobals = [];
+  try {
+    if (Array.isArray(window.webpackChunk)) chunkGlobals.push(window.webpackChunk);
+  } catch {}
+  try {
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (!/^webpackChunk/i.test(key)) continue;
+      const value = window[key];
+      if (Array.isArray(value) && !chunkGlobals.includes(value)) {
+        chunkGlobals.push(value);
+      }
+    }
+  } catch {}
+
+  for (const chunkGlobal of chunkGlobals) {
+    try {
+      let captured = null;
+      const chunkId = `jms-parental-pin-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      chunkGlobal.push([[chunkId], {}, (req) => {
+        captured = req;
+      }]);
+      if (typeof captured === "function") {
+        try { window.__jmsParentalPinWebpackRequire = captured; } catch {}
+        return captured;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function collectWebpackPlaybackManagersForParentalPinHook() {
+  const req = getWebpackRequireForParentalPinHook();
+  if (!req) return [];
+
+  const out = [];
+  const add = (candidate, label) => {
+    if (!candidate || typeof candidate.play !== "function") return;
+    out.push({ target: candidate, label });
+  };
+
+  try {
+    const direct = req(39738);
+    add(direct?.f, "webpack:39738");
+  } catch {}
+
+  try {
+    if (req.c) {
+      for (const [moduleId, mod] of Object.entries(req.c)) {
+        const candidate = mod?.exports?.f;
+        if (candidate?.play && candidate?.canPlay && candidate?.getCurrentPlayer) {
+          add(candidate, `webpack:${moduleId}`);
+        }
+      }
+    }
+  } catch {}
+
+  return out;
+}
+
+function collectNativePlaybackManagersForParentalPinHook() {
+  const out = [];
+  const seen = new Set();
+  const add = (candidate, label) => {
+    if (!candidate || (typeof candidate !== "object" && typeof candidate !== "function")) return;
+    if (typeof candidate.play !== "function") return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    out.push({ target: candidate, label });
+  };
+
+  [
+    [window.playbackManager, "window.playbackManager"],
+    [window.MediaBrowser?.playbackManager, "MediaBrowser.playbackManager"],
+    [window.MediaBrowser?.PlaybackManager, "MediaBrowser.PlaybackManager"],
+    [window.Emby?.playbackManager, "Emby.playbackManager"],
+    [window.Emby?.PlaybackManager, "Emby.PlaybackManager"],
+    [window.appRouter?.playbackManager, "appRouter.playbackManager"],
+    [window.__playbackManager, "__playbackManager"],
+    [window.__jellyfinPlaybackManager, "__jellyfinPlaybackManager"],
+    [window.__jmsPlaybackManager, "__jmsPlaybackManager"]
+  ].forEach(([candidate, label]) => add(candidate, label));
+
+  try {
+    for (const key of Object.getOwnPropertyNames(window)) {
+      if (!/playback/i.test(key)) continue;
+      try { add(window[key], `window.${key}`); } catch {}
+    }
+  } catch {}
+
+  for (const candidate of collectWebpackPlaybackManagersForParentalPinHook()) {
+    add(candidate.target, candidate.label);
+  }
+
+  return out;
+}
+
+async function fetchNativePlaybackItemDetails(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id) return null;
+
+  try {
+    const api = await import("../../Plugins/JMSFusion/runtime/api.js");
+    if (typeof api?.fetchItemDetails === "function") {
+      return await api.fetchItemDetails(id);
+    }
+  } catch (error) {
+    console.warn("[JMSFusion] Parental PIN native item lookup failed:", error);
+  }
+
+  return null;
+}
+
+async function resolveNativePlaybackItemForPin(context = {}) {
+  const candidate = context?.item;
+  if (candidate?.Type && getPlaybackItemId(candidate)) {
+    return candidate;
+  }
+
+  const itemId = context?.itemId || getPlaybackItemId(candidate);
+  if (!itemId) return candidate || null;
+
+  if (candidate && getPlaybackItemId(candidate)) {
+    return candidate;
+  }
+
+  const fetched = await fetchNativePlaybackItemDetails(itemId);
+  if (fetched) return fetched;
+  return candidate || { Id: itemId };
+}
+
+async function enrichParentalGateItem(item) {
+  if (!item || typeof item !== "object") return item;
+  let gateItem = item;
+
+  if (!gateItem?.OfficialRating && gateItem?.SeriesId) {
+    const parentSeries = await fetchNativePlaybackItemDetails(gateItem.SeriesId).catch(() => null);
+    if (parentSeries?.OfficialRating) {
+      gateItem = {
+        ...gateItem,
+        OfficialRating: parentSeries.OfficialRating
+      };
+    }
+  }
+
+  return gateItem;
+}
+
+function shouldSkipParentalPinNativeHook() {
+  if (nativePlaybackHookBypassDepth > 0 || Date.now() < nativePlaybackHookBypassUntil) {
+    return true;
+  }
+
+  try {
+    if (window.__jmsParentalPinNativeHookBypass === true) return true;
+    if (window.__jmsCinemaPreRollNativeHookBypass === true) return true;
+  } catch {}
+
+  return false;
+}
+
+export function armParentalPinNativePlaybackBypass(delayMs = NATIVE_PLAYBACK_CHAIN_BYPASS_MS) {
+  nativePlaybackHookBypassUntil = Math.max(
+    nativePlaybackHookBypassUntil,
+    Date.now() + Math.max(0, Number(delayMs) || 0)
+  );
+  try { window.__jmsParentalPinNativeHookBypass = true; } catch {}
+}
+
+function callOriginalNativePlay(original, target, args, { chainBypassMs = 0 } = {}) {
+  if (chainBypassMs > 0) {
+    armParentalPinNativePlaybackBypass(chainBypassMs);
+  }
+
+  nativePlaybackHookBypassDepth += 1;
+  try {
+    return original.apply(target, args);
+  } finally {
+    nativePlaybackHookBypassDepth = Math.max(0, nativePlaybackHookBypassDepth - 1);
+    if (chainBypassMs > 0) {
+      armParentalPinNativePlaybackBypass(chainBypassMs);
+    }
+  }
+}
+
+async function runParentalPinBeforeNativePlay(original, target, args, label) {
+  if (!isParentalPinModuleEnabled(getConfig())) {
+    return callOriginalNativePlay(original, target, args);
+  }
+
+  if (shouldSkipParentalPinNativeHook()) {
+    return callOriginalNativePlay(original, target, args);
+  }
+
+  const context = extractNativePlaybackContext(args);
+  const itemId = context.itemId || getPlaybackItemId(context.item);
+  if (!itemId) {
+    return callOriginalNativePlay(original, target, args);
+  }
+
+  let item = await resolveNativePlaybackItemForPin(context);
+  if (!item) {
+    return callOriginalNativePlay(original, target, args);
+  }
+
+  if (isMusicPlaybackItem(item)) {
+    const gmmpHandled = await tryRouteMusicPlaybackToGmmp(item, itemId);
+    if (gmmpHandled) return true;
+
+    return callOriginalNativePlay(original, target, args, {
+      chainBypassMs: NATIVE_PLAYBACK_CHAIN_BYPASS_MS
+    });
+  }
+
+  item = await enrichParentalGateItem(item);
+
+  const allowed = await ensureParentalPinBeforePlayback(item, { bypassItemId: itemId });
+  if (!allowed) {
+    return false;
+  }
+
+  return callOriginalNativePlay(original, target, args, {
+    chainBypassMs: NATIVE_PLAYBACK_CHAIN_BYPASS_MS
+  });
+}
+
+function patchNativePlaybackManagerForParentalPin(target, label) {
+  if (!target || typeof target.play !== "function") return false;
+  if (nativePlaybackHookPatchedTargets.has(target)) return false;
+
+  const currentPlay = target.play;
+  if (currentPlay?.__jmsParentalPinWrapped === true) {
+    nativePlaybackHookPatchedTargets.add(target);
+    return false;
+  }
+
+  const wrapped = function parentalPinWrappedNativePlay(...args) {
+    return runParentalPinBeforeNativePlay(currentPlay, target, args, label);
+  };
+
+  try {
+    Object.defineProperty(wrapped, "__jmsParentalPinWrapped", { value: true });
+    Object.defineProperty(wrapped, "__jmsParentalPinOriginalPlay", { value: currentPlay });
+    Object.defineProperty(wrapped, "__jmsParentalPinPlayLabel", { value: label });
+    target.play = wrapped;
+    nativePlaybackHookPatchedTargets.add(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function patchKnownNativePlaybackManagersForParentalPin() {
+  if (typeof window === "undefined") return false;
+
+  let patchedAny = false;
+  for (const { target, label } of collectNativePlaybackManagersForParentalPinHook()) {
+    patchedAny = patchNativePlaybackManagerForParentalPin(target, label) || patchedAny;
+  }
+  return patchedAny;
+}
+
+function installNativePlaybackHook() {
+  if (nativePlaybackHookInstalled || typeof window === "undefined" || typeof document === "undefined") {
+    return;
+  }
+
+  nativePlaybackHookInstalled = true;
+  nativePlaybackHookScanStartedAt = Date.now();
+
+  const scan = () => {
+    if (!isParentalPinModuleEnabled(getConfig())) return;
+    patchKnownNativePlaybackManagersForParentalPin();
+    if (
+      nativePlaybackHookScanTimer &&
+      Date.now() - nativePlaybackHookScanStartedAt > NATIVE_HOOK_MAX_SCAN_MS
+    ) {
+      window.clearInterval(nativePlaybackHookScanTimer);
+      nativePlaybackHookScanTimer = 0;
+    }
+  };
+
+  scan();
+  nativePlaybackHookScanTimer = window.setInterval(scan, NATIVE_HOOK_SCAN_INTERVAL_MS);
+  window.addEventListener("pageshow", scan, { passive: true });
+  window.addEventListener("focus", scan, { passive: true });
+}
+
 function installNativePlayInterceptor() {
   if (nativePlayInterceptorInstalled || typeof document === "undefined") {
     return;
@@ -1298,6 +1870,7 @@ function installNativePlayInterceptor() {
 
   const interceptNativePlayEvent = (event) => {
     if (!event.isTrusted) return false;
+    if (!isPrimaryNativePlayActivationEvent(event)) return false;
 
     rememberNativePlayContextFromEvent(event);
 
@@ -1306,6 +1879,10 @@ function installNativePlayInterceptor() {
 
     const itemId = extractItemIdFromNativePlayButton(button);
     if (!itemId) return false;
+
+    if ((getConfig?.() || {}).enabledGmmp === false && isKnownMusicPlaybackElement(button)) {
+      return false;
+    }
 
     rememberNativePlayContext(itemId);
 
@@ -1332,9 +1909,6 @@ function installNativePlayInterceptor() {
     rememberNativePlayContextFromEvent(event);
   }, true);
 
-  document.addEventListener("pointerdown", interceptNativePlayEvent, true);
-  document.addEventListener("mousedown", interceptNativePlayEvent, true);
-  document.addEventListener("touchstart", interceptNativePlayEvent, true);
   document.addEventListener("click", interceptNativePlayEvent, true);
   document.addEventListener("dblclick", interceptNativePlayEvent, true);
 
@@ -1421,7 +1995,7 @@ async function showPinPrompt({ itemName, officialRating, threshold, ruleLabel })
             inputmode="numeric"
             autocomplete="off"
             maxlength="8"
-            placeholder="${escapeHtml(labels.parentalPinNewPlaceholder || "4-8 digits")}"
+            placeholder="${escapeHtml(labels.parentalPinNewPlaceholderUi || "4-8 digits")}"
           />
           <div class="jms-parental-pin-slots" aria-hidden="true">
             ${buildPinSlots()}
@@ -1596,6 +2170,7 @@ async function showPinPrompt({ itemName, officialRating, threshold, ruleLabel })
 
 export async function ensureParentalPinBeforePlayback(item, { bypassItemId = null } = {}) {
   void bypassItemId;
+  if (isMusicPlaybackItem(item)) return true;
 
   const evaluate = async () => {
     const labels = getLabels();
@@ -1660,4 +2235,5 @@ export async function ensureParentalPinBeforePlayback(item, { bypassItemId = nul
   return activePromptPromise;
 }
 
+installNativePlaybackHook();
 installNativePlayInterceptor();

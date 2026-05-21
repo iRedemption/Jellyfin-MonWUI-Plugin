@@ -1,4 +1,4 @@
-const API_ROOT = "/JMSFusion/parental-pin";
+const API_ROOT = "/Plugins/JMSFusion/parental-pin";
 const POLICY_CACHE_MS = 15_000;
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_LOCKOUT_MINUTES = 15;
@@ -10,6 +10,7 @@ let policyCache = {
   ts: 0,
   promise: null
 };
+let runtimeApiPromise = null;
 
 function pickFirstString(...values) {
   for (const value of values) {
@@ -166,6 +167,30 @@ function getTokenSafe() {
   }
 }
 
+function getAuthorizationHeaderSafe() {
+  const api = getApiClientSafe();
+  try {
+    return pickFirstString(
+      typeof api?.getAuthorizationHeader === "function" ? api.getAuthorizationHeader() : "",
+      typeof window !== "undefined" && typeof window.getAuthHeader === "function" ? window.getAuthHeader() : ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+async function getRuntimeApiSafe() {
+  try {
+    if (!runtimeApiPromise) {
+      runtimeApiPromise = import("../../Plugins/JMSFusion/runtime/api.js");
+    }
+    return await runtimeApiPromise;
+  } catch {
+    runtimeApiPromise = null;
+    return null;
+  }
+}
+
 function readStoredJson(key) {
   try {
     const raw = localStorage.getItem(key) || sessionStorage.getItem(key) || "";
@@ -237,7 +262,13 @@ function getLiveUserIdSafe() {
       typeof api?.getCurrentUserId === "function" ? api.getCurrentUserId() : "",
       api?._currentUserId,
       api?._currentUser?.Id,
-      api?._serverInfo?.UserId
+      api?._currentUser?.UserId,
+      api?._serverInfo?.UserId,
+      api?._serverInfo?.User?.Id,
+      api?._serverInfo?.User?.UserId,
+      api?.serverInfo?.UserId,
+      api?.serverInfo?.User?.Id,
+      api?.serverInfo?.User?.UserId
     );
   } catch {
     return "";
@@ -272,34 +303,77 @@ async function getUserIdSafe() {
 }
 
 async function getAuthContext() {
-  const [userId, token] = await Promise.all([
+  const [userId, token, runtimeApi] = await Promise.all([
     getUserIdSafe(),
-    Promise.resolve(getTokenSafe())
+    Promise.resolve(getTokenSafe()),
+    getRuntimeApiSafe()
   ]);
 
+  let runtimeSession = null;
+  try {
+    runtimeSession = typeof runtimeApi?.getSessionInfo === "function" ? runtimeApi.getSessionInfo() : null;
+  } catch {
+    runtimeSession = null;
+  }
+
+  let runtimeAuthHeader = "";
+  try {
+    runtimeAuthHeader = typeof runtimeApi?.getAuthHeader === "function" ? runtimeApi.getAuthHeader() : "";
+  } catch {
+    runtimeAuthHeader = "";
+  }
+
   return {
-    userId: String(userId || "").trim(),
-    token: String(token || "").trim()
+    userId: pickFirstString(runtimeSession?.userId, userId),
+    token: pickFirstString(runtimeSession?.accessToken, runtimeSession?.token, token),
+    authHeader: pickFirstString(runtimeAuthHeader, getAuthorizationHeaderSafe())
   };
 }
 
-async function getAuthHeaders() {
+async function getAuthHeaders(authContext = null) {
   const headers = {
     Accept: "application/json",
     "Content-Type": "application/json",
   };
 
-  const { userId, token } = await getAuthContext();
+  const { userId, token, authHeader } = authContext || await getAuthContext();
+  const authorization = pickFirstString(authHeader, getAuthorizationHeaderSafe());
+  if (authorization) {
+    headers.Authorization = authorization;
+    headers["X-Emby-Authorization"] = authorization;
+  }
   if (token) headers["X-Emby-Token"] = token;
-  if (userId) headers["X-Emby-UserId"] = userId;
+  if (userId) {
+    headers["X-Emby-UserId"] = userId;
+    headers["X-MediaBrowser-UserId"] = userId;
+  }
   return headers;
 }
 
+function appendUserIdQuery(path, userId) {
+  const normalizedUserId = String(userId || "").trim();
+  if (!normalizedUserId) return path;
+
+  try {
+    const url = new URL(`${API_ROOT}${path}`, window.location.origin);
+    if (!url.searchParams.get("UserId") && !url.searchParams.get("userId")) {
+      url.searchParams.set("UserId", normalizedUserId);
+    }
+
+    return `${url.pathname}${url.search}${url.hash}`.replace(API_ROOT, "");
+  } catch {
+    const separator = String(path || "").includes("?") ? "&" : "?";
+    return `${path}${separator}UserId=${encodeURIComponent(normalizedUserId)}`;
+  }
+}
+
 async function request(path, { method = "GET", body } = {}) {
-  const headers = await getAuthHeaders();
-  const response = await fetch(`${API_ROOT}${path}`, {
+  const authContext = await getAuthContext();
+  const headers = await getAuthHeaders(authContext);
+  const response = await fetch(`${API_ROOT}${appendUserIdQuery(path, authContext.userId)}`, {
     method,
     cache: "no-store",
+    credentials: "same-origin",
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });

@@ -709,6 +709,7 @@ export function getConfig() {
     indexZeroSelection: localStorage.getItem('indexZeroSelection') !== 'false',
     showFavoriteButton: localStorage.getItem('showFavoriteButton') !== 'false',
     watchlistTabsSliderEnabled: localStorage.getItem('watchlistTabsSliderEnabled') !== 'false',
+    watchlistSharingEnabled: localStorage.getItem('watchlistSharingEnabled') !== 'false',
     watchlistAutoRemovePlayed: localStorage.getItem('watchlistAutoRemovePlayed') === 'true',
     watchlistAutoRemovePlayedFromFavorites: localStorage.getItem('watchlistAutoRemovePlayedFromFavorites') === 'true',
     watchlistImportFavoritesOnStartup: localStorage.getItem('watchlistImportFavoritesOnStartup') === 'true',
@@ -736,7 +737,7 @@ export function getConfig() {
     useRandomContent: localStorage.getItem('useRandomContent') !== 'false',
     fullscreenMode: localStorage.getItem('fullscreenMode') === 'true' ? true : false,
     listLimit: 20,
-    version: "v3.0.0",
+    version: "v3.1.0",
     historySize: 20,
     updateInterval: 300000,
     nextTracksSource: localStorage.getItem('nextTracksSource') || 'playlist',
@@ -905,6 +906,7 @@ export function getConfig() {
     enableSubtitleCustomizerModule: (localStorage.getItem('enableSubtitleCustomizerModule') || 'true') !== 'false',
     enableParentalPinModule: (localStorage.getItem('enableParentalPinModule') || 'true') !== 'false',
     enableDetailsModalModule: (localStorage.getItem('enableDetailsModalModule') || 'true') !== 'false',
+    enableSerrArrIntegrationModule: (localStorage.getItem('enableSerrArrIntegrationModule') || 'true') !== 'false',
     enableCastModule: (localStorage.getItem('enableCastModule') || 'true') !== 'false',
     allowSharedCastViewerForUsers: localStorage.getItem('allowSharedCastViewerForUsers') === 'true',
     detailsModalTmdbReviewsEnabled: (localStorage.getItem('detailsModalTmdbReviewsEnabled') || 'true') !== 'false',
@@ -1018,6 +1020,7 @@ export function getConfig() {
     profileChooserAutoOpen: localStorage.getItem('profileChooserAutoOpen') !== 'false',
     profileChooserAutoOpenRequireQuickLogin: localStorage.getItem('profileChooserAutoOpenRequireQuickLogin') !== 'false',
     profileChooserRememberTokens: localStorage.getItem('profileChooserRememberTokens') !== 'false',
+    profileChooserHideUsersFromRegularUsers: localStorage.getItem('profileChooserHideUsersFromRegularUsers') === 'true',
 
     enablePersonalRecommendations: localStorage.getItem('enablePersonalRecommendations') !== 'false',
     showPersonalRecsHeroCards: localStorage.getItem('showPersonalRecsHeroCards') !== 'false',
@@ -1433,6 +1436,11 @@ export function isCinemaPreRollModuleEnabled(source = null) {
 export function isDetailsModalModuleEnabled(source = null) {
   const cfg = source || getConfig();
   return cfg?.enableDetailsModalModule !== false;
+}
+
+export function isSerrArrIntegrationModuleEnabled(source = null) {
+  const cfg = source || getConfig();
+  return cfg?.enableSerrArrIntegrationModule !== false;
 }
 
 export function getDetailsModalRuntimeConfig(source = null) {

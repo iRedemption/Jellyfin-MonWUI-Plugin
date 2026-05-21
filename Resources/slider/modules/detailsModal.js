@@ -7,7 +7,16 @@ import { formatOfficialRatingLabel, getYoutubeEmbedUrl } from "./utils.js";
 import { getGlobalTmdbApiKey, sanitizeTmdbApiKey } from "./jmsPluginConfig.js";
 import { ensureStudioHubLogoFromTmdb, ensureStudioHubManualEntry, JMS_STUDIO_HUB_MANUAL_ENTRY_ADDED_EVENT } from "./studioHubsShared.js";
 import { showNotification } from "./player/ui/notification.js";
-import { WATCHLIST_MODAL_ID, getWatchlistButtonText, getWatchlistTabKey, getWatchlistToast, openWatchlistModal } from "./watchlist.js";
+import { WATCHLIST_MODAL_ID, getWatchlistButtonText, getWatchlistTabKey, getWatchlistToast, isWatchlistSharingEnabled, openWatchlistModal, openWatchlistShareOverlayForItem } from "./watchlist.js";
+import { appendSerrRequestButton } from "./seerr/ui.js";
+import {
+  ensureSerrMissingVisualStyles,
+  getSerrMissingSyntheticItems,
+  getSerrMissingSyntheticPosterUrl,
+  isSerrMissingSyntheticItem,
+  isSerrMissingSyntheticItemRequested,
+  requestSerrMissingSyntheticItem
+} from "./seerr/itemPageBridge.js";
 
 const config = getConfig();
 const labels =
@@ -31,13 +40,19 @@ let _closing = false;
 let _openOrigin = null;
 let _ytApiPromise = null;
 const _boxSetCache = new Map();
+const _serrMissingPreviewItems = new Map();
 const _autoAddStudioHubPendingIds = new Set();
 const _autoAddedStudioHubIds = new Set();
 const _autoStudioHubLogoPendingIds = new Set();
 const _autoStudioHubLogoResolvedIds = new Set();
 const TTL_MOVIE_BOXSET = 7 * 24 * 60 * 60 * 1000;
+const COLLECTION_PREVIEW_FIELDS = [
+  "Id", "Name", "OriginalTitle", "Type", "ProviderIds", "ProductionYear", "PremiereDate",
+  "LocationType", "RunTimeTicks", "ImageTags", "PrimaryImageAspectRatio", "UserData", "CommunityRating"
+].join(",");
 const NESTED_MODAL_SCROLL_ALLOW_SELECTOR = [
   `#${MODAL_ID} .jmsdm-card`,
+  `#${MODAL_ID} .monwuiwl-share-card`,
   `#${WATCHLIST_MODAL_ID}.visible .monwuiwl-card`,
   `#${WATCHLIST_MODAL_ID}.visible .monwuiwl-share-card`
 ].join(", ");
@@ -1625,7 +1640,7 @@ async function startHeroTrailer(root, item, { signal } = {}) {
   const heroImg = hero.querySelector("img");
   const showImg = (on) => { try { if (heroImg) heroImg.style.opacity = on ? "1" : "0"; } catch {} };
 
-  if (!item?.__jmsVirtualTrailer && safeText(item?.Id)) {
+  if (!item?.__monwuiVirtualTrailer && safeText(item?.Id)) {
     try {
       const locals = await fetchLocalTrailers(item.Id, { signal });
       if (signal?.aborted) return;
@@ -2739,14 +2754,35 @@ function getAudioImageUrlMini(track, { maxWidth = 260, fallbackAlbumId = "" } = 
 }
 
 function renderMiniCards(items = []) {
+  ensureSerrMissingVisualStyles();
   if (!items.length) {
     return `<div class="jmsdm-empty-state" style="color:rgba(255,255,255,.6);font-size:14px;padding:20px;text-align:center;">${config.languageLabels.contentNotFound || "Henüz benzer içerik bulunamadı."}</div>`;
   }
+  items.forEach((item) => {
+    if (isSerrMissingSyntheticItem(item) && item?.Id) _serrMissingPreviewItems.set(String(item.Id), item);
+  });
+
+  const renderSerrOverlayButton = (requested = false) => {
+    const actionTitle = requested
+      ? label("serrStatusRequested", "İstek")
+      : label("serrRequestButton", "İste");
+    const iconName = requested ? "check" : "playlist_add";
+    const disabled = requested ? " disabled aria-disabled=\"true\"" : "";
+    return `
+      <div class="cardOverlayContainer">
+        <button is="paper-icon-button-light" type="button" class="cardOverlayButton cardOverlayButton-hover paper-icon-button-light monwui-serr-native-card-btn cardOverlayFab-primary" title="${escapeHtml(actionTitle)}" aria-label="${escapeHtml(actionTitle)}"${disabled}>
+          <span class="material-icons cardOverlayButtonIcon cardOverlayButtonIcon-hover ${iconName}" aria-hidden="true"></span>
+        </button>
+      </div>
+    `;
+  };
 
   return `
     <div class="jmsdm-minicards">
       ${items.map((it) => {
-        const img = getPrimaryImageUrlMini(it);
+        const isMissing = isSerrMissingSyntheticItem(it);
+        const isRequested = isSerrMissingSyntheticItemRequested(it);
+        const img = getSerrMissingSyntheticPosterUrl(it, "w342") || getPrimaryImageUrlMini(it);
         const title = safeText(it.Name, "");
         const year = it.ProductionYear ? `(${it.ProductionYear})` : "";
         const rating = it.CommunityRating
@@ -2754,19 +2790,22 @@ function renderMiniCards(items = []) {
           : false;
 
         return `
-          <div class="jmsdm-minicard" data-itemid="${it.Id}" title="${escapeHtml(title)}">
+          <div class="jmsdm-minicard ${isMissing ? "monwui-serr-missing-card" : ""} ${isRequested ? "monwui-serr-requested" : ""}" data-itemid="${escapeHtml(it.Id)}" ${isMissing ? "data-monwui-serr-missing-preview=\"1\"" : ""} ${isRequested ? "data-serr-requested=\"1\"" : ""} title="${escapeHtml(title)}">
             <div class="jmsdm-minicard-img">
+              ${isMissing ? `<span class="monwui-serr-missing-badge">${escapeHtml(config.languageLabels.serrMissingBadge || "Eksik")}</span>` : ""}
               ${
                 img
-                  ? `<img src="${img}" alt="${escapeHtml(title)}" loading="lazy" decoding="async">`
+                  ? `<img src="${escapeHtml(img)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async">`
                   : `<div class="jmsdm-skeleton" style="width:100%;height:100%;"></div>`
               }
 
-              <div class="jmsdm-minicard-overlay" aria-hidden="true">
+              ${isMissing ? renderSerrOverlayButton(isRequested) : `
+                <div class="jmsdm-minicard-overlay" aria-hidden="true">
                 <div class="jmsdm-minicard-play">
                   ${icon("M8 5v14l11-7z")}
                 </div>
               </div>
+              `}
             </div>
 
             <div class="jmsdm-minicard-title">
@@ -3118,7 +3157,7 @@ async function fetchCollectionItems(boxsetId, { signal, limit = 12 } = {}) {
     qp.set("ParentId", String(boxsetId));
     qp.set("IncludeItemTypes", "Movie");
     qp.set("Limit", String(limit));
-    qp.set("Fields", "Id,Name,ProductionYear,ImageTags,PrimaryImageAspectRatio,UserData");
+    qp.set("Fields", COLLECTION_PREVIEW_FIELDS);
     qp.set("SortBy", "ProductionYear,SortName");
     qp.set("SortOrder", "Ascending");
 
@@ -3147,14 +3186,29 @@ function renderCollectionHtml({ title = "", items = [] } = {}) {
   `;
 }
 
+async function appendSerrMissingPreviewItems(containerItem, items = [], { mode = "collection", signal, limit = 12, compareItems = null } = {}) {
+  const base = Array.isArray(items) ? items : [];
+  const compare = Array.isArray(compareItems) ? compareItems : base;
+  const missing = await getSerrMissingSyntheticItems(containerItem, compare, { mode, signal }).catch(() => []);
+  if (!missing.length) return base.slice(0, limit);
+  const roomForBase = Math.max(0, limit - missing.length);
+  return [...base.slice(0, roomForBase), ...missing].slice(0, limit);
+}
+
 const TTL_BOXSET_ITEMS = 2 * 24 * 60 * 60 * 1000;
 
 function minimizeItems(items = []) {
   return (items || []).map(x => ({
     Id: x.Id,
     Name: x.Name,
+    OriginalTitle: x.OriginalTitle,
+    Type: x.Type,
+    ProviderIds: x.ProviderIds || x.providerIds,
     ProductionYear: x.ProductionYear,
+    PremiereDate: x.PremiereDate,
     CommunityRating: x.CommunityRating,
+    LocationType: x.LocationType,
+    RunTimeTicks: x.RunTimeTicks,
     ImageTags: x.ImageTags,
     PrimaryImageAspectRatio: x.PrimaryImageAspectRatio,
     UserData: x.UserData,
@@ -3175,7 +3229,7 @@ async function fetchCollectionItemsAll(boxsetId, { signal } = {}) {
     qp.set("UserId", userId);
     qp.set("ParentId", String(boxsetId));
     qp.set("IncludeItemTypes", "Movie");
-    qp.set("Fields", "Id,Name,ProductionYear,ImageTags,PrimaryImageAspectRatio,UserData,CommunityRating");
+    qp.set("Fields", COLLECTION_PREVIEW_FIELDS);
     qp.set("SortBy", "ProductionYear,SortName");
     qp.set("SortOrder", "Ascending");
     qp.set("Limit", String(PAGE));
@@ -3396,7 +3450,9 @@ function startBoxSetLoad(root, boxsetItem, { signal } = {}) {
       ]);
       if (!_open || signal?.aborted) return;
 
-      itemsHost.innerHTML = renderMiniCards((items || []).slice(0, 12));
+      const itemsWithMissing = await appendSerrMissingPreviewItems(boxsetItem, items || [], { mode: "collection", signal, limit: 12 });
+      if (!_open || signal?.aborted) return;
+      itemsHost.innerHTML = renderMiniCards(itemsWithMissing);
       otherHost.innerHTML = renderMiniCards(others || []);
     } catch (e) {
       if (!signal?.aborted) console.warn("boxset load error:", e);
@@ -3467,12 +3523,12 @@ function startCollectionLoad(root, movieItem, { signal } = {}) {
 
       if (cachedOk) {
         const filtered = (cachedItemsRow.items || [])
-          .filter(x => x?.Id && String(x.Id) !== String(movieItem.Id))
-          .slice(0, 12);
+          .filter(x => x?.Id && String(x.Id) !== String(movieItem.Id));
+        const filteredWithMissing = await appendSerrMissingPreviewItems(movieItem, filtered, { mode: "collection", signal, limit: 12, compareItems: cachedItemsRow.items || [] });
 
         host.innerHTML = renderCollectionHtml({
           title: box.name ? `${collectionLabel}: ${box.name}` : collectionLabel,
-          items: filtered
+          items: filteredWithMissing
         });
 
         CollectionCacheDB.idle(async () => {
@@ -3482,13 +3538,13 @@ function startCollectionLoad(root, movieItem, { signal } = {}) {
             await CollectionCacheDB.setBoxsetItems(box.id, minimized);
 
             const filtered2 = minimized
-              .filter(x => x?.Id && String(x.Id) !== String(movieItem.Id))
-              .slice(0, 12);
+              .filter(x => x?.Id && String(x.Id) !== String(movieItem.Id));
+            const filtered2WithMissing = await appendSerrMissingPreviewItems(movieItem, filtered2, { mode: "collection", signal: _bgAbort?.signal || null, limit: 12, compareItems: minimized });
 
             if (_open && !signal?.aborted && root?.isConnected) {
               host.innerHTML = renderCollectionHtml({
                 title: box.name ? `${collectionLabel}: ${box.name}` : collectionLabel,
-                items: filtered2
+                items: filtered2WithMissing
               });
             }
           } catch {}
@@ -3504,12 +3560,12 @@ function startCollectionLoad(root, movieItem, { signal } = {}) {
       await CollectionCacheDB.setBoxsetItems(box.id, minimized);
 
       const filtered = minimized
-        .filter(x => x?.Id && String(x.Id) !== String(movieItem.Id))
-        .slice(0, 12);
+        .filter(x => x?.Id && String(x.Id) !== String(movieItem.Id));
+      const filteredWithMissing = await appendSerrMissingPreviewItems(movieItem, filtered, { mode: "collection", signal, limit: 12, compareItems: minimized });
 
       host.innerHTML = renderCollectionHtml({
         title: box.name ? `${collectionLabel}: ${box.name}` : collectionLabel,
-        items: filtered
+        items: filteredWithMissing
       });
     } catch (e) {
       if (!signal?.aborted) console.warn("collection load error:", e);
@@ -3592,7 +3648,7 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
 
   setTimeout(() => { if (_open) focusFirst(root); }, 50);
 
-  let item = preloadedItem && preloadedItem.__jmsVirtualTrailer === true
+  let item = preloadedItem && preloadedItem.__monwuiVirtualTrailer === true
     ? preloadedItem
     : null;
   if (!item && resolvedItemId) {
@@ -3622,7 +3678,7 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
   }
 
   const baseItem = item;
-  const isVirtualTrailer = baseItem?.__jmsVirtualTrailer === true;
+  const isVirtualTrailer = baseItem?.__monwuiVirtualTrailer === true;
   let seriesItem = null;
   const isEpisode = baseItem?.Type === "Episode";
   if (!isVirtualTrailer && isEpisode && baseItem?.SeriesId) {
@@ -3711,6 +3767,7 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
   let isFavorite = isFavInitial;
   let recos = { title: "", items: [] };
   let seasons = [];
+  let seriesDetailsForSerr = isSeries ? baseItem : null;
   let selectedSeasonId =
     baseItem.Type === "Season"
       ? baseItem.Id
@@ -3722,6 +3779,23 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
     selectedSeasonId = seasons[0]?.Id || null;
   } else if (baseItem.Type === "Season" && seriesId) {
     seasons = await fetchSeasonsForSeries(seriesId, { signal: _abort.signal });
+    if (!_open || _abort.signal.aborted) return;
+  } else if (isEpisode && seriesId) {
+    seasons = await fetchSeasonsForSeries(seriesId, { signal: _abort.signal });
+    if (!_open || _abort.signal.aborted) return;
+    const selectedSeasonExists = seasons.some((season) => String(season?.Id) === String(selectedSeasonId));
+    if (!selectedSeasonId || !selectedSeasonExists) {
+      const currentSeasonNumber = Number(baseItem?.ParentIndexNumber);
+      const currentSeason = seasons.find((season) => Number(season?.IndexNumber) === currentSeasonNumber);
+      if (!selectedSeasonId) {
+        selectedSeasonId = currentSeason?.Id || null;
+      } else if (currentSeason?.Id) {
+        selectedSeasonId = currentSeason.Id;
+      }
+    }
+  }
+  if (!seriesDetailsForSerr && seriesId) {
+    seriesDetailsForSerr = await fetchItemDetailsFull(seriesId, { signal: _abort.signal }).catch(() => null);
     if (!_open || _abort.signal.aborted) return;
   }
 
@@ -3846,9 +3920,35 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
     { label: label("communityRating", "TMDb"), value: community ? `TMDb ${community}` : "" }
   ].filter((entry) => safeText(entry?.value));
 
+  async function loadEpisodesForSelectedSeason(seasonId) {
+    const localEpisodes = await fetchEpisodesFor(seriesId, seasonId, { signal: _abort.signal });
+    const selectedSeason = seasons.find((season) => String(season?.Id) === String(seasonId)) ||
+      (baseItem.Type === "Season" ? baseItem : null) ||
+      (isEpisode && Number.isFinite(Number(baseItem?.ParentIndexNumber))
+        ? {
+            Id: seasonId || baseItem?.SeasonId || baseItem?.ParentId || "",
+            SeriesId: seriesId,
+            IndexNumber: Number(baseItem.ParentIndexNumber),
+            Name: baseItem?.SeasonName || `${config.languageLabels.season || "Sezon"} ${baseItem.ParentIndexNumber}`
+          }
+        : null);
+    if (selectedSeason && seriesDetailsForSerr) {
+      const missingEpisodes = await getSerrMissingSyntheticItems(selectedSeason, localEpisodes, {
+        mode: "episode",
+        seriesItem: seriesDetailsForSerr,
+        signal: _abort.signal
+      }).catch(() => []);
+      return [
+        ...localEpisodes.filter((episode) => !isSerrMissingSyntheticItem(episode)),
+        ...missingEpisodes.filter((episode) => isSerrMissingSyntheticItem(episode))
+      ];
+    }
+    return localEpisodes;
+  }
+
   let episodes = [];
   if (seriesId) {
-    episodes = await fetchEpisodesFor(seriesId, selectedSeasonId, { signal: _abort.signal });
+    episodes = await loadEpisodesForSelectedSeason(selectedSeasonId);
   }
   if (!_open || _abort.signal.aborted) return;
 
@@ -3869,6 +3969,10 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
 
     const id = card.getAttribute("data-itemid");
     if (!id) return;
+    if (card.getAttribute("data-monwui-serr-missing-preview") === "1") {
+      await requestSerrMissingSyntheticItem(_serrMissingPreviewItems.get(String(id)), { button: card.querySelector(".monwui-serr-native-card-btn") });
+      return;
+    }
 
     try {
       await openDetailsModal({
@@ -3887,6 +3991,7 @@ export async function openDetailsModal({ itemId, item: preloadedItem = null, det
 wireMiniCardDelegation();
 
   function renderEpisodesHtml() {
+    ensureSerrMissingVisualStyles();
     const items = pageSlice();
     if (!items.length) {
       return `<div style="color:rgba(255,255,255,.75);font-size:13px;line-height:1.5;">${config.languageLabels.episodeNotFound || "Bölüm bulunamadı."}</div>`;
@@ -3898,23 +4003,27 @@ wireMiniCardDelegation();
           const e = ep.IndexNumber ?? "";
           const num = (s !== "" && e !== "") ? `S${s} · E${e}` : String((page - 1) * perPage + i + 1);
           const epName = safeText(ep.Name, config.languageLabels.episode || "Bölüm");
-          const img = getEpisodeImageUrlMini(ep, { maxWidth: 260 });
+          const isMissing = isSerrMissingSyntheticItem(ep);
+          const isRequested = isSerrMissingSyntheticItemRequested(ep);
+          if (isMissing && ep?.Id) _serrMissingPreviewItems.set(String(ep.Id), ep);
+          const img = getSerrMissingSyntheticPosterUrl(ep, "w500") || getEpisodeImageUrlMini(ep, { maxWidth: 260 });
           const epOver = safeText(ep.Overview, "");
           return `
-          <div class="jmsdm-ep" data-epid="${ep.Id}">
-            <div class="jmsdm-ep-thumb">
+          <div class="jmsdm-ep${isMissing ? " monwui-serr-missing-listitem" : ""}${isRequested ? " monwui-serr-requested" : ""}" data-epid="${escapeHtml(ep.Id)}" ${isMissing ? "data-monwui-serr-missing-preview=\"1\"" : ""} ${isRequested ? "data-serr-requested=\"1\"" : ""}>
+            <div class="jmsdm-ep-thumb${isMissing ? " monwui-serr-missing-thumb" : ""}">
+              ${isMissing ? `<span class="monwui-serr-missing-badge">${escapeHtml(config.languageLabels.serrMissingBadge || "Eksik")}</span>` : ""}
               ${
                 img
-                  ? `<img src="${img}" alt="${escapeHtml(epName)}" loading="lazy" decoding="async">`
+                  ? `<img src="${escapeHtml(img)}" alt="${escapeHtml(epName)}" loading="lazy" decoding="async">`
                   : `<div class="jmsdm-skeleton" style="width:100%;height:100%;"></div>`
               }
             </div>
 
-            <div class="jmsdm-ep-num">${num}</div>
+            <div class="jmsdm-ep-num">${isMissing ? `<span class="material-icons ${isRequested ? "check" : "playlist_add"}" aria-hidden="true"></span><span>${escapeHtml(String(num))}</span>` : escapeHtml(String(num))}</div>
 
             <div class="jmsdm-ep-main">
-              <div class="jmsdm-ep-name">${epName}</div>
-              <div class="jmsdm-ep-over">${epOver}</div>
+              <div class="jmsdm-ep-name">${escapeHtml(epName)}</div>
+              <div class="jmsdm-ep-over">${escapeHtml(epOver)}</div>
             </div>
           </div>
         `;
@@ -4111,6 +4220,9 @@ wireMiniCardDelegation();
         ${icon(isFavorite ? "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z" : "M12.1 18.55l-.1.1-.11-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87C13.46 5.99 14.96 5 16.5 5 18.5 5 20 6.5 20 8.5c0 2.89-3.14 5.74-7.9 10.05z")}
         ${getWatchlistButtonText(baseItem, isFavorite)}
       </button>
+      ${isWatchlistSharingEnabled() ? `<button type="button" class="jmsdm-btn jmsdm-share">
+        ${icon("M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11A2.99 2.99 0 1 0 15 5c0 .24.04.47.09.69L8.04 9.81A3 3 0 1 0 8.04 14.2l7.12 4.17c-.04.2-.06.41-.06.63A2.9 2.9 0 1 0 18 16.08z")} ${label("watchlistShareAction", "Paylaş")}
+      </button>` : ""}
       <button class="jmsdm-btn jmsdm-watchlist-open">
         ${icon("M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z")} ${config.languageLabels.watchlistOpen || "İzleme Listesi"}
       </button>
@@ -4177,6 +4289,22 @@ wireMiniCardDelegation();
   _unbindKeyHandler = wireCloseHandlers(root, closeDetailsModal);
   try { root.style.visibility = "visible"; root.style.opacity = "1"; } catch {}
 
+  function wireSerrRequestButtons() {
+    const actions = root.querySelector(".jmsdm-actions");
+    if (actions && isTrailerItem) {
+      appendSerrRequestButton(actions, baseItem, {
+        source: "tmdb-trailer-row",
+        label: label("serrRequestFromTrailer", "İste"),
+        requestAllSeasons: false,
+        mediaType: "movie",
+        mediaId: Number(baseItem?.__tmdbId || 0),
+        title: name
+      }).catch(() => {});
+    }
+  }
+
+  wireSerrRequestButtons(root);
+
   await __animateInFromOrigin(root);
 
   if (isMovie) {
@@ -4201,6 +4329,7 @@ wireMiniCardDelegation();
   const openBtn = root.querySelector(".jmsdm-openpage");
   const externalBtn = root.querySelector(".jmsdm-external");
   const favBtn  = root.querySelector(".jmsdm-fav");
+  const shareBtn = root.querySelector(".jmsdm-share");
   const watchlistBtn = root.querySelector(".jmsdm-watchlist-open");
   const initialResumeTicks = isTrailerItem ? 0 : getResumeTicksFromItem(baseItem);
 
@@ -4301,6 +4430,25 @@ wireMiniCardDelegation();
         itemId: baseItem?.Id,
         item: baseItem
       });
+    });
+  }
+  if (shareBtn) {
+    addEventListener(shareBtn, "click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        if (!isWatchlistSharingEnabled()) {
+          window.showMessage?.(label("watchlistSharingDisabled", "İzleme listesi paylaşımı kapalı"), "info");
+          return;
+        }
+        shareBtn.disabled = true;
+        stopHeroMedia(root);
+        await openWatchlistShareOverlayForItem(baseItem, { root });
+      } catch (error) {
+        window.showMessage?.(error?.message || label("watchlistShareError", "Paylaşım başarısız"), "error");
+      } finally {
+        try { shareBtn.disabled = false; } catch {}
+      }
     });
   }
 
@@ -4449,6 +4597,10 @@ wireMiniCardDelegation();
 
       const epId = el.getAttribute("data-epid");
       if (!epId) return;
+      if (el.getAttribute("data-monwui-serr-missing-preview") === "1") {
+        await requestSerrMissingSyntheticItem(_serrMissingPreviewItems.get(String(epId)), { button: el.querySelector(".jmsdm-ep-num") });
+        return;
+      }
       try {
         const started = await playNow(epId);
         if (!started) return;
@@ -4470,6 +4622,10 @@ wireMiniCardDelegation();
         e.stopPropagation();
         const id = el.getAttribute("data-itemid");
         if (!id) return;
+        if (el.getAttribute("data-monwui-serr-missing-preview") === "1") {
+          await requestSerrMissingSyntheticItem(_serrMissingPreviewItems.get(String(id)), { button: el.querySelector(".monwui-serr-native-card-btn") });
+          return;
+        }
         try {
           await openDetailsModal({ itemId: id, serverId, preferBackdropIndex, perPage });
         } catch (err) {
@@ -4486,6 +4642,7 @@ wireMiniCardDelegation();
     const currentScroll = right.scrollTop;
 
     right.innerHTML = renderRightPanelHtml();
+    wireSerrRequestButtons(right);
     if (isMovie || isBoxSet || isMusicType) {
       wireMiniCardClicks();
       right.scrollTop = currentScroll;
@@ -4521,7 +4678,7 @@ wireMiniCardDelegation();
 
         try {
           right.innerHTML = `<div class="jmsdm-skeleton" style="width:40%;height:12px;margin-top:6px;"></div>`;
-          episodes = await fetchEpisodesFor(seriesId, selectedSeasonId, { signal: _abort.signal });
+          episodes = await loadEpisodesForSelectedSeason(selectedSeasonId);
           if (!_open || _abort.signal.aborted) return;
           rerenderRight();
         } catch (err) {
@@ -4566,7 +4723,7 @@ wireMiniCardDelegation();
       selectedSeasonId = v;
       page = 1;
       try {
-        episodes = await fetchEpisodesFor(seriesId, selectedSeasonId, { signal: _abort.signal });
+        episodes = await loadEpisodesForSelectedSeason(selectedSeasonId);
         if (!_open || _abort.signal.aborted) return;
         rerenderRight();
       } catch (err) {

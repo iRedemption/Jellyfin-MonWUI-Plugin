@@ -213,16 +213,20 @@ export function createSliderPanel(config, labels) {
       input.disabled = true;
       input.checked = false;
     }
-    const showExtra = input.checked;
-    const extraFields = [
+    const peakRailFields = [
       peakSpanLeftLabel, peakSpanLeftInput,
       peakSpanRightLabel, peakSpanRightInput,
       peakGapRightLabel, peakGapRightInput,
-      peakGapLeftLabel, peakGapLeftInput,
+      peakGapLeftLabel, peakGapLeftInput
+    ];
+    const diagonalOnlyFields = [
       peakGapYLabel, peakGapYInput
     ];
-    extraFields.forEach(el => {
-      el.style.display = showExtra ? '' : 'none';
+    peakRailFields.forEach(el => {
+      el.style.display = isPeak ? '' : 'none';
+    });
+    diagonalOnlyFields.forEach(el => {
+      el.style.display = (isPeak && input.checked) ? '' : 'none';
     });
   }
 

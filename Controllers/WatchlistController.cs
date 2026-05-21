@@ -54,6 +54,17 @@ namespace Jellyfin.Plugin.JMSFusion.Controllers
         public sealed class ShareItemRequest
         {
             public string? ItemId { get; set; }
+            public string? ItemType { get; set; }
+            public string? Name { get; set; }
+            public string? Overview { get; set; }
+            public int? ProductionYear { get; set; }
+            public long? RunTimeTicks { get; set; }
+            public double? CommunityRating { get; set; }
+            public string? OfficialRating { get; set; }
+            public List<string>? Genres { get; set; }
+            public string? AlbumArtist { get; set; }
+            public List<string>? Artists { get; set; }
+            public string? ParentName { get; set; }
             public List<ShareTargetDto>? Targets { get; set; }
             public string? Note { get; set; }
         }
@@ -327,12 +338,17 @@ namespace Jellyfin.Plugin.JMSFusion.Controllers
         }
 
         [HttpPost("shares")]
-        public IActionResult ShareItem([FromBody] ShareItemRequest req)
+        public IActionResult ShareItem([FromBody] ShareItemRequest? req)
         {
             var user = ReadUserContext();
             if (string.IsNullOrWhiteSpace(user.UserId))
             {
                 return Unauthorized(new { ok = false, error = "X-Emby-UserId gerekli" });
+            }
+
+            if (req is null)
+            {
+                return BadRequest(new { ok = false, error = "İstek gövdesi gerekli" });
             }
 
             var itemId = Clean(req.ItemId);
@@ -367,13 +383,9 @@ namespace Jellyfin.Plugin.JMSFusion.Controllers
                     Same(candidate.OwnerUserId, user.UserId) &&
                     Same(candidate.ItemId, itemId));
 
-                if (entry is null)
-                {
-                    return NotFound(new { ok = false, error = "Öğe watchlist içinde bulunamadı" });
-                }
-
                 var note = NormalizeNote(req.Note);
                 var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                entry ??= CreateShareSourceEntry(itemId, req, user, now);
 
                 foreach (var target in targets)
                 {
@@ -553,15 +565,80 @@ namespace Jellyfin.Plugin.JMSFusion.Controllers
             return HasShareSnapshot(share) ? share.EntrySnapshot : null;
         }
 
+        private static WatchlistEntry CreateShareSourceEntry(string itemId, ShareItemRequest req, UserContext user, long now)
+        {
+            var entry = new WatchlistEntry
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                ItemId = itemId,
+                AddedAtUtc = now,
+                OwnerUserId = user.UserId,
+                OwnerUserName = user.UserName
+            };
+
+            ApplySnapshot(entry, req, user);
+            NormalizeEntry(entry);
+            return entry;
+        }
+
         private static bool ApplySnapshot(WatchlistEntry entry, AddItemRequest req, UserContext user)
         {
+            return ApplySnapshotValues(
+                entry,
+                req.ItemType,
+                req.Name,
+                req.Overview,
+                req.ProductionYear,
+                req.RunTimeTicks,
+                req.CommunityRating,
+                req.OfficialRating,
+                req.Genres,
+                req.AlbumArtist,
+                req.Artists,
+                req.ParentName,
+                user);
+        }
+
+        private static bool ApplySnapshot(WatchlistEntry entry, ShareItemRequest req, UserContext user)
+        {
+            return ApplySnapshotValues(
+                entry,
+                req.ItemType,
+                req.Name,
+                req.Overview,
+                req.ProductionYear,
+                req.RunTimeTicks,
+                req.CommunityRating,
+                req.OfficialRating,
+                req.Genres,
+                req.AlbumArtist,
+                req.Artists,
+                req.ParentName,
+                user);
+        }
+
+        private static bool ApplySnapshotValues(
+            WatchlistEntry entry,
+            string? requestedItemType,
+            string? requestedName,
+            string? requestedOverview,
+            int? requestedProductionYear,
+            long? requestedRunTimeTicks,
+            double? requestedCommunityRating,
+            string? requestedOfficialRating,
+            List<string>? requestedGenres,
+            string? requestedAlbumArtist,
+            List<string>? requestedArtists,
+            string? requestedParentName,
+            UserContext user)
+        {
             var changed = false;
-            var itemType = Clean(req.ItemType);
-            var name = Clean(req.Name);
-            var overview = Clean(req.Overview);
-            var officialRating = Clean(req.OfficialRating);
-            var albumArtist = Clean(req.AlbumArtist);
-            var parentName = Clean(req.ParentName);
+            var itemType = Clean(requestedItemType);
+            var name = Clean(requestedName);
+            var overview = Clean(requestedOverview);
+            var officialRating = Clean(requestedOfficialRating);
+            var albumArtist = Clean(requestedAlbumArtist);
+            var parentName = Clean(requestedParentName);
 
             if (!Same(entry.ItemType, itemType))
             {
@@ -605,32 +682,32 @@ namespace Jellyfin.Plugin.JMSFusion.Controllers
                 changed = true;
             }
 
-            if (entry.ProductionYear != req.ProductionYear)
+            if (entry.ProductionYear != requestedProductionYear)
             {
-                entry.ProductionYear = req.ProductionYear;
+                entry.ProductionYear = requestedProductionYear;
                 changed = true;
             }
 
-            if (entry.RunTimeTicks != req.RunTimeTicks)
+            if (entry.RunTimeTicks != requestedRunTimeTicks)
             {
-                entry.RunTimeTicks = req.RunTimeTicks;
+                entry.RunTimeTicks = requestedRunTimeTicks;
                 changed = true;
             }
 
-            if (entry.CommunityRating != req.CommunityRating)
+            if (entry.CommunityRating != requestedCommunityRating)
             {
-                entry.CommunityRating = req.CommunityRating;
+                entry.CommunityRating = requestedCommunityRating;
                 changed = true;
             }
 
-            var genres = NormalizeStringList(req.Genres);
+            var genres = NormalizeStringList(requestedGenres);
             if (!ListsEqual(entry.Genres, genres))
             {
                 entry.Genres = genres;
                 changed = true;
             }
 
-            var artists = NormalizeStringList(req.Artists);
+            var artists = NormalizeStringList(requestedArtists);
             if (!ListsEqual(entry.Artists, artists))
             {
                 entry.Artists = artists;

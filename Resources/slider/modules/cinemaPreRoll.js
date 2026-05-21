@@ -1,27 +1,36 @@
 import { getConfig } from "./config.js";
 import { closeDetailsModalIfLoaded } from "./detailsModalLoader.js";
+import { showNotification } from "./player/ui/notification.js";
+import { createSerrRequest, getSerrAccess, listSerrRequests } from "./seerr/api.js";
 import {
   buildCinemaPreRollCacheUrl,
   resolveCinemaPreRollLocale
 } from "./cinemaPreRollLocale.js";
 
-const TRAILER_POOL_CACHE_KEY = "jms:cinema-preroll:pool:v2";
+const TRAILER_POOL_CACHE_KEY = "jms:cinema-preroll:pool:v5";
 const TRAILER_DAILY_PLAYED_KEY_PREFIX = "jms:cinema-preroll:played:v1:";
 const TRAILER_POOL_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_TRAILER_COUNT = 2;
 const MAX_TRAILER_COUNT = 5;
 const MAX_DAILY_PLAYED_IDS = 150;
-const PLAYER_WATCHDOG_MS = 15_000;
-const YT_API_TIMEOUT_MS = 4_500;
-const YT_PLAYABILITY_PROBE_TIMEOUT_MS = 3_500;
-const YT_PLAYABILITY_PROBE_READY_GRACE_MS = 1_200;
+const NEW_TRAILER_PAST_WINDOW_DAYS = 70;
+const NEW_TRAILER_FUTURE_WINDOW_DAYS = 365;
+const PLAYER_WATCHDOG_MS = 5_000;
+const TRAILER_POOL_FETCH_TIMEOUT_MS = 2_500;
+const TRAILER_POOL_BACKGROUND_FETCH_TIMEOUT_MS = 4_000;
+const YT_API_TIMEOUT_MS = 3_000;
+const YT_PLAYABILITY_PROBE_TIMEOUT_MS = 1_400;
+const YT_PLAYABILITY_PROBE_READY_GRACE_MS = 450;
 const MIN_ACCEPTABLE_YT_HEIGHT = 720;
 const TRAILER_QUALITY_RETRY_DELAYS_MS = [0, 350, 1200, 2600];
-const MAX_TRAILER_CANDIDATE_ATTEMPTS = 150;
+const MAX_TRAILER_CANDIDATE_ATTEMPTS = 24;
+const SKIP_TRAILER_PLAYABILITY_PROBE = true;
+const CINEMA_SERR_REQUEST_STATE_CACHE_MS = 15_000;
 const NATIVE_HOOK_SCAN_INTERVAL_MS = 2_000;
 const NATIVE_HOOK_RECENT_TTL_MS = 15_000;
 const NATIVE_HOOK_MAX_SCAN_MS = 5 * 60_000;
 const NATIVE_PLAYBACK_CHAIN_BYPASS_MS = 12_000;
+const NATIVE_PLAYBACK_DEDUPE_MS = 2 * 60_000;
 const ADULT_CONTENT_MARKERS = Object.freeze([
   "porn",
   "porno",
@@ -56,6 +65,7 @@ const YT_QUALITY_HEIGHT_MAP = Object.freeze({
 });
 
 let youtubeApiPromise = null;
+let trailerPoolRefreshPromise = null;
 let overlayStyleInjected = false;
 let nativePlaybackHookInstalled = false;
 let nativePlaybackHookScanTimer = 0;
@@ -63,6 +73,17 @@ let nativePlaybackHookScanStartedAt = 0;
 let nativePlaybackHookBypassDepth = 0;
 let nativePlaybackHookBypassUntil = 0;
 let cinemaPreRollSessionActive = false;
+let cinemaPreRollSessionPromise = null;
+let cinemaPreRollSessionItemId = "";
+let nativePlaybackGate = null;
+let currentOverlay = null;
+let originalBodyOverflow = "";
+let originalHtmlOverflow = "";
+let originalDocumentScrollRestoration = null;
+let cinemaSerrRequestStateCache = null;
+let cinemaSerrRequestStateCacheAt = 0;
+let cinemaSerrRequestStatePromise = null;
+const cinemaSerrRequestedTrailerIds = new Set();
 const nativePlaybackHookPatchedTargets = new WeakSet();
 const recentNativePreRollItems = new Map();
 const PANEL_HIDDEN_CLASS = "monwui-cinema-preroll--panel-hidden";
@@ -85,6 +106,267 @@ function escapeAttribute(value) {
     .replace(/>/g, "&gt;");
 }
 
+function serrLabel(key, fallback) {
+  const labels = getLabels();
+  return getText(labels?.[key], fallback);
+}
+
+function serrArrModuleEnabled() {
+  try { return getConfig()?.enableSerrArrIntegrationModule !== false; } catch { return true; }
+}
+
+function accessHasSerr(access) {
+  return serrArrModuleEnabled() && access?.serrEnabled !== false && access?.enabled === true;
+}
+
+function accessCanRequestCinemaMovie(access) {
+  return serrArrModuleEnabled() && (accessHasSerr(access) || access?.arrRadarrEnabled === true);
+}
+
+function notifyCinemaSerr(message, type = "info") {
+  const clean = getText(message);
+  if (!clean) return;
+  try {
+    showNotification(`<i class="fas fa-clapperboard" style="margin-right:8px;"></i>${escapeAttribute(clean)}`, 3200, type);
+  } catch {
+    window.showMessage?.(clean, type === "error" ? "error" : "success");
+  }
+}
+
+function normalizeSerrStatus(status) {
+  return String(status ?? "").trim().toLowerCase();
+}
+
+function isActiveSerrRequestStatus(status) {
+  const clean = normalizeSerrStatus(status);
+  return clean !== "completed" &&
+    clean !== "available" &&
+    clean !== "declined" &&
+    clean !== "failed" &&
+    clean !== "withdrawn";
+}
+
+function buildCinemaSerrRequestState(requests = []) {
+  const movieIds = new Set();
+  for (const req of Array.isArray(requests) ? requests : []) {
+    const mediaType = String(req?.MediaType ?? req?.mediaType ?? "").trim().toLowerCase();
+    const mediaId = Number(req?.MediaId ?? req?.mediaId);
+    if (mediaType !== "movie" || !Number.isFinite(mediaId) || mediaId <= 0) continue;
+    if (!isActiveSerrRequestStatus(req?.Status ?? req?.status)) continue;
+    movieIds.add(mediaId);
+  }
+  return { movieIds };
+}
+
+async function getCinemaSerrRequestState({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && cinemaSerrRequestStateCache && (now - cinemaSerrRequestStateCacheAt) < CINEMA_SERR_REQUEST_STATE_CACHE_MS) {
+    return cinemaSerrRequestStateCache;
+  }
+  if (!force && cinemaSerrRequestStatePromise) return cinemaSerrRequestStatePromise;
+
+  cinemaSerrRequestStatePromise = listSerrRequests({ includeHistory: false, includeDownloads: false })
+    .then((data) => buildCinemaSerrRequestState(data?.requests || data?.Requests || []))
+    .catch(() => buildCinemaSerrRequestState([]))
+    .then((state) => {
+      cinemaSerrRequestStateCache = state;
+      cinemaSerrRequestStateCacheAt = Date.now();
+      return state;
+    })
+    .finally(() => {
+      cinemaSerrRequestStatePromise = null;
+    });
+
+  return cinemaSerrRequestStatePromise;
+}
+
+function rememberCinemaSerrRequest(tmdbId) {
+  const id = Number(tmdbId);
+  if (!Number.isFinite(id) || id <= 0) return;
+  cinemaSerrRequestedTrailerIds.add(id);
+  if (cinemaSerrRequestStateCache?.movieIds) {
+    cinemaSerrRequestStateCache.movieIds.add(id);
+    cinemaSerrRequestStateCacheAt = Date.now();
+  }
+}
+
+function isCinemaTrailerRequested(trailer, state = null) {
+  const tmdbId = Number(trailer?.tmdbId);
+  if (!Number.isFinite(tmdbId) || tmdbId <= 0) return false;
+  return cinemaSerrRequestedTrailerIds.has(tmdbId) || !!state?.movieIds?.has?.(tmdbId);
+}
+
+function cinemaSerrButtonLabel() {
+  return serrLabel("serrRequestFromTrailer", serrLabel("serrRequestButton", "İste"));
+}
+
+function setCinemaSerrButtonBaseState(button) {
+  if (!button) return;
+  const label = cinemaSerrButtonLabel();
+  button.disabled = false;
+  button.classList.remove("is-loading", "is-requested");
+  button.removeAttribute("aria-disabled");
+  button.dataset.serrBusy = "0";
+  button.dataset.serrRequested = "0";
+  button.setAttribute("title", label);
+  button.setAttribute("aria-label", label);
+  button.innerHTML = `<i class="fa-solid fa-clapperboard" aria-hidden="true"></i><span>${escapeAttribute(label)}</span>`;
+}
+
+function setCinemaSerrButtonLoading(button) {
+  if (!button) return;
+  const label = serrLabel("serrRequestSending", "Gönderiliyor...");
+  button.disabled = true;
+  button.classList.add("is-loading");
+  button.classList.remove("is-requested");
+  button.dataset.serrBusy = "1";
+  button.setAttribute("aria-disabled", "true");
+  button.setAttribute("title", label);
+  button.setAttribute("aria-label", label);
+  button.innerHTML = `<i class="fas fa-spinner fa-spin" aria-hidden="true"></i><span>${escapeAttribute(label)}</span>`;
+}
+
+function setCinemaSerrButtonRequested(button) {
+  if (!button) return;
+  const label = serrLabel("serrStatusRequested", "İstek");
+  button.disabled = true;
+  button.classList.remove("is-loading");
+  button.classList.add("is-requested");
+  button.dataset.serrBusy = "0";
+  button.dataset.serrRequested = "1";
+  button.setAttribute("aria-disabled", "true");
+  button.setAttribute("title", label);
+  button.setAttribute("aria-label", label);
+  button.innerHTML = `<i class="fa-solid fa-check" aria-hidden="true"></i><span>${escapeAttribute(label)}</span>`;
+}
+
+function cinemaSerrStatusLabel(status) {
+  switch (normalizeSerrStatus(status)) {
+    case "pending": return serrLabel("serrStatusPending", "Onay bekliyor");
+    case "approved": return serrLabel("serrStatusApproved", "Onaylandı");
+    case "processing": return serrLabel("serrStatusProcessing", "İşleniyor");
+    case "completed":
+    case "available": return serrLabel("serrStatusCompleted", "Tamamlandı");
+    case "declined": return serrLabel("serrStatusDeclined", "Reddedildi");
+    case "failed": return serrLabel("serrStatusFailed", "Hatalı");
+    case "withdrawn": return serrLabel("serrStatusWithdrawn", "Geri çekildi");
+    default: return serrLabel("serrStatusApproved", "Onaylandı");
+  }
+}
+
+function cinemaSerrLowerStatusLabel(status) {
+  const label = cinemaSerrStatusLabel(status);
+  try { return label.toLocaleLowerCase("tr-TR"); } catch { return label.toLowerCase(); }
+}
+
+function cinemaSerrStatusMessage(result) {
+  if (result?.backend === "arr" || result?.service === "radarr") {
+    return serrLabel("arrMovieRequestSent", "Film isteği Radarr'a gönderildi.");
+  }
+  if (result?.duplicate) {
+    const status = cinemaSerrLowerStatusLabel(result?.duplicateStatus || result?.request?.Status || result?.request?.status);
+    const own = result?.duplicateOwnedByCurrentUser === true;
+    const fallback = own
+      ? "Bu istek zaten sizin tarafınızdan oluşturuldu ve {status}."
+      : "Bu istek başka bir kullanıcı tarafından oluşturuldu ve {status}.";
+    return serrLabel(own ? "serrDuplicateOwnRequest" : "serrDuplicateOtherRequest", fallback).replace("{status}", status);
+  }
+  if (result?.pendingApproval) return serrLabel("serrRequestPendingToast", "İstek yönetici onayına gönderildi.");
+  const status = normalizeSerrStatus(result?.request?.Status || result?.request?.status);
+  if (status === "approved" || status === "processing") return serrLabel("serrRequestApprovedToast", "İstek Seerr'e gönderildi.");
+  return serrLabel("serrRequestCreatedToast", "İstek oluşturuldu.");
+}
+
+function cinemaSerrRequestErrorMessage(error) {
+  const code = getText(error?.payload?.code || error?.payload?.errorCode);
+  const message = getText(error?.message || error?.payload?.error);
+  if (code === "serrAlreadyAvailable" || code === "already_available" || /already available in jellyfin/i.test(message)) {
+    return serrLabel("serrAlreadyAvailable", "Bu içerik Jellyfin'de zaten mevcut.");
+  }
+  return message || serrLabel("serrRequestFailed", "Seerr isteği oluşturulamadı.");
+}
+
+function isCurrentCinemaSerrTrailer(overlay, tmdbId) {
+  const currentId = Number(overlay?.__jmsCinemaPreRollCurrentTrailer?.tmdbId);
+  return Number.isFinite(currentId) && currentId === Number(tmdbId);
+}
+
+async function refreshCinemaSerrButtonForTrailer(overlay, trailer, { force = false } = {}) {
+  if (!serrArrModuleEnabled()) return;
+  const button = overlay?.querySelector?.('[data-action="serr-request"]');
+  if (!button) return;
+
+  const tmdbId = Number(trailer?.tmdbId);
+  if (!Number.isFinite(tmdbId) || tmdbId <= 0) {
+    button.hidden = true;
+    return;
+  }
+
+  if (button.dataset.serrBusy === "1" && isCurrentCinemaSerrTrailer(overlay, tmdbId)) return;
+
+  button.hidden = true;
+  setCinemaSerrButtonBaseState(button);
+
+  const access = await getSerrAccess().catch(() => null);
+  if (!button.isConnected || !isCurrentCinemaSerrTrailer(overlay, tmdbId)) return;
+  if (!access?.enabled || !accessCanRequestCinemaMovie(access)) return;
+
+  const requestState = await getCinemaSerrRequestState({ force }).catch(() => buildCinemaSerrRequestState([]));
+  if (!button.isConnected || !isCurrentCinemaSerrTrailer(overlay, tmdbId)) return;
+
+  button.hidden = false;
+  if (isCinemaTrailerRequested(trailer, requestState)) {
+    setCinemaSerrButtonRequested(button);
+  }
+}
+
+async function submitCinemaSerrRequest(overlay) {
+  if (!serrArrModuleEnabled()) return;
+  const button = overlay?.querySelector?.('[data-action="serr-request"]');
+  const trailer = overlay?.__jmsCinemaPreRollCurrentTrailer;
+  const tmdbId = Number(trailer?.tmdbId);
+  if (!button || button.hidden || button.disabled || !Number.isFinite(tmdbId) || tmdbId <= 0) return;
+  if (button.dataset.serrRequested === "1") return;
+
+  try {
+    setCinemaSerrButtonLoading(button);
+    const access = await getSerrAccess().catch(() => null);
+    if (!access?.enabled || !accessCanRequestCinemaMovie(access)) {
+      throw new Error(serrLabel("serrDisabled", "Seerr entegrasyonu etkin değil."));
+    }
+
+    const result = await createSerrRequest({
+      mediaType: "movie",
+      mediaId: Math.floor(tmdbId),
+      seasons: [],
+      episodes: [],
+      requestAllSeasons: false,
+      title: getText(trailer?.title, serrLabel("serrMovie", "Film")),
+      source: "cinema-preroll",
+      jellyfinItemId: ""
+    });
+
+    if (result?.ok === false) {
+      const error = new Error(result?.error || serrLabel("serrRequestFailed", "Seerr isteği oluşturulamadı."));
+      error.payload = result;
+      throw error;
+    }
+
+    rememberCinemaSerrRequest(tmdbId);
+    if (isCurrentCinemaSerrTrailer(overlay, tmdbId)) {
+      setCinemaSerrButtonRequested(button);
+    }
+    notifyCinemaSerr(cinemaSerrStatusMessage(result), "success");
+    try { window.dispatchEvent(new CustomEvent("monwui:serr-requests-changed")); } catch {}
+  } catch (error) {
+    if (isCurrentCinemaSerrTrailer(overlay, tmdbId)) {
+      setCinemaSerrButtonBaseState(button);
+      button.hidden = false;
+    }
+    notifyCinemaSerr(cinemaSerrRequestErrorMessage(error), "error");
+  }
+}
+
 function clampTrailerCount(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed)) return DEFAULT_TRAILER_COUNT;
@@ -94,9 +376,21 @@ function clampTrailerCount(value) {
 function shouldRunForItem(item) {
   const type = String(item?.Type || "");
   const mediaType = String(item?.MediaType || "");
+  const collectionType = String(item?.CollectionType || item?.collectionType || "").trim().toLowerCase();
   const extraType = String(item?.ExtraType || "").trim();
   const resumeTicks = Number(item?.UserData?.PlaybackPositionTicks || 0);
 
+  if (
+    mediaType === "Audio" ||
+    type === "Audio" ||
+    type === "MusicVideo" ||
+    type === "MusicAlbum" ||
+    type === "MusicArtist" ||
+    type === "Playlist" ||
+    (type === "Folder" && (collectionType === "music" || collectionType === "musicvideos" || collectionType === "audio"))
+  ) {
+    return false;
+  }
   if (extraType) return false;
   if (resumeTicks > 0) return false;
   if (mediaType && mediaType !== "Video") return false;
@@ -105,6 +399,82 @@ function shouldRunForItem(item) {
 
 function getItemId(item) {
   return String(item?.Id || item?.id || item?.ItemId || item?.itemId || "").trim();
+}
+
+function getCurrentUserIdSafe() {
+  try {
+    const api = window.ApiClient || window.apiClient || window.MediaBrowser?.ApiClient || null;
+    return String(
+      (typeof api?.getCurrentUserId === "function" ? api.getCurrentUserId() : "") ||
+      api?._currentUserId ||
+      api?._currentUser?.Id ||
+      api?._serverInfo?.UserId ||
+      ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+function getCurrentAccessTokenSafe() {
+  try {
+    const api = window.ApiClient || window.apiClient || window.MediaBrowser?.ApiClient || null;
+    return String(
+      (typeof api?.accessToken === "function" ? api.accessToken() : "") ||
+      api?._serverInfo?.AccessToken ||
+      api?._accessToken ||
+      api?._authToken ||
+      ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+function restoreDocumentScroll() {
+  try {
+    if (document.body) document.body.style.overflow = originalBodyOverflow;
+    if (document.documentElement) document.documentElement.style.overflow = originalHtmlOverflow;
+    if (originalDocumentScrollRestoration !== null && typeof history.scrollRestoration === "string") {
+      history.scrollRestoration = originalDocumentScrollRestoration;
+    }
+  } catch {}
+}
+
+function lockDocumentScroll() {
+  try {
+    if (originalBodyOverflow === "") {
+      originalBodyOverflow = document.body?.style?.overflow || "";
+    }
+    if (originalHtmlOverflow === "") {
+      originalHtmlOverflow = document.documentElement?.style?.overflow || "";
+    }
+    if (originalDocumentScrollRestoration === null && typeof history.scrollRestoration === "string") {
+      originalDocumentScrollRestoration = history.scrollRestoration;
+      try { history.scrollRestoration = "manual"; } catch {}
+    }
+    if (document.body) document.body.style.overflow = "hidden";
+    if (document.documentElement) document.documentElement.style.overflow = "hidden";
+  } catch {}
+}
+
+function buildCinemaPreRollFetchHeaders() {
+  const headers = { Accept: "application/json" };
+  const userId = getCurrentUserIdSafe();
+  const token = getCurrentAccessTokenSafe();
+  if (userId) {
+    headers["X-Emby-UserId"] = userId;
+    headers["X-MediaBrowser-UserId"] = userId;
+  }
+  if (token) {
+    headers["X-Emby-Token"] = token;
+  }
+  return headers;
+}
+
+function buildTrailerRuntimeCacheKey(locale) {
+  const userId = getCurrentUserIdSafe() || "anon";
+  return `${String(locale?.cacheKey || "default").trim() || "default"}:user:${userId}`;
 }
 
 function pruneRecentNativePreRollItems() {
@@ -246,12 +616,31 @@ function looksAdultTrailerItem(item) {
   return ADULT_CONTENT_MARKERS.some((marker) => text.includes(marker));
 }
 
+function parseTrailerReleaseDate(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function isCurrentTrailerRelease(value) {
+  const releaseDate = parseTrailerReleaseDate(value);
+  if (!releaseDate) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const minDate = new Date(today);
+  minDate.setDate(minDate.getDate() - NEW_TRAILER_PAST_WINDOW_DAYS);
+  const maxDate = new Date(today);
+  maxDate.setDate(maxDate.getDate() + NEW_TRAILER_FUTURE_WINDOW_DAYS);
+  return releaseDate >= minDate && releaseDate <= maxDate;
+}
+
 async function fetchCinemaPreRollCache(locale, { signal } = {}) {
   const url = buildCinemaPreRollCacheUrl(locale);
   const response = await fetch(url.toString(), {
     method: "GET",
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: buildCinemaPreRollFetchHeaders(),
     signal
   });
   const rawText = await response.text().catch(() => "");
@@ -264,6 +653,43 @@ async function fetchCinemaPreRollCache(locale, { signal } = {}) {
     return JSON.parse(rawText);
   } catch {
     return null;
+  }
+}
+
+async function fetchCinemaPreRollCacheWithTimeout(locale, {
+  signal,
+  timeoutMs = TRAILER_POOL_FETCH_TIMEOUT_MS
+} = {}) {
+  let controller = null;
+  let timeoutId = 0;
+  let abortForwarder = null;
+  let fetchSignal = signal;
+
+  if (typeof AbortController === "function" && timeoutMs > 0) {
+    controller = new AbortController();
+    fetchSignal = controller.signal;
+
+    if (signal) {
+      if (signal.aborted) {
+        controller.abort();
+      } else {
+        abortForwarder = () => controller.abort();
+        try { signal.addEventListener("abort", abortForwarder, { once: true }); } catch {}
+      }
+    }
+
+    timeoutId = window.setTimeout(() => {
+      try { controller.abort(); } catch {}
+    }, timeoutMs);
+  }
+
+  try {
+    return await fetchCinemaPreRollCache(locale, { signal: fetchSignal });
+  } finally {
+    try { clearTimeout(timeoutId); } catch {}
+    if (signal && abortForwarder) {
+      try { signal.removeEventListener("abort", abortForwarder); } catch {}
+    }
   }
 }
 
@@ -280,20 +706,54 @@ function normalizeCacheItems(payload) {
       backdropUrl: String(item?.backdropUrl ?? item?.BackdropUrl ?? "").trim(),
       posterUrl: String(item?.posterUrl ?? item?.PosterUrl ?? "").trim(),
       sourceList: String(item?.sourceList ?? item?.SourceList ?? "").trim(),
+      originalLanguage: String(item?.originalLanguage ?? item?.OriginalLanguage ?? "").trim(),
+      officialRating: String(item?.officialRating ?? item?.OfficialRating ?? "").trim(),
+      ratingScore: Number(item?.ratingScore ?? item?.RatingScore),
+      ratingSubScore: Number(item?.ratingSubScore ?? item?.RatingSubScore),
+      certificationCountry: String(item?.certificationCountry ?? item?.CertificationCountry ?? "").trim(),
       adult: item?.adult === true || item?.Adult === true
     }))
-    .filter((item) => Number.isFinite(item.tmdbId) && item.youtubeKey && !looksAdultTrailerItem(item));
+    .filter((item) =>
+      Number.isFinite(item.tmdbId) &&
+      item.youtubeKey &&
+      isCurrentTrailerRelease(item.releaseDate) &&
+      !looksAdultTrailerItem(item));
+}
+
+function refreshTrailerPoolCacheInBackground(locale, runtimeCacheKey) {
+  if (trailerPoolRefreshPromise) return trailerPoolRefreshPromise;
+
+  trailerPoolRefreshPromise = fetchCinemaPreRollCacheWithTimeout(locale, {
+    timeoutMs: TRAILER_POOL_BACKGROUND_FETCH_TIMEOUT_MS
+  })
+    .then((payload) => {
+      const items = normalizeCacheItems(payload);
+      if (items.length) writePoolCache(runtimeCacheKey, items);
+      return items;
+    })
+    .catch(() => [])
+    .finally(() => {
+      trailerPoolRefreshPromise = null;
+    });
+
+  return trailerPoolRefreshPromise;
 }
 
 async function fetchNowPlayingTrailerPool({ signal } = {}) {
   const locale = resolveCinemaPreRollLocale();
-  const cached = readPoolCache(locale.cacheKey) || [];
+  const runtimeCacheKey = buildTrailerRuntimeCacheKey(locale);
+  const cached = readPoolCache(runtimeCacheKey) || [];
 
-  const payload = await fetchCinemaPreRollCache(locale, { signal }).catch(() => null);
+  if (cached.length) {
+    void refreshTrailerPoolCacheInBackground(locale, runtimeCacheKey);
+    return cached;
+  }
+
+  const payload = await fetchCinemaPreRollCacheWithTimeout(locale, { signal }).catch(() => null);
   const items = normalizeCacheItems(payload);
 
   if (items.length) {
-    writePoolCache(locale.cacheKey, items);
+    writePoolCache(runtimeCacheKey, items);
     return items;
   }
 
@@ -343,11 +803,24 @@ function buildTrailerCandidateQueue(items = [], cacheKey = "default", {
 }
 
 function getTrailerCandidateAttemptLimit(requestedCount, poolCount) {
-  const desired = Math.max(
-    requestedCount,
-    MAX_TRAILER_CANDIDATE_ATTEMPTS
+  const safeRequested = Math.max(1, Number(requestedCount) || DEFAULT_TRAILER_COUNT);
+  const desired = Math.min(
+    MAX_TRAILER_CANDIDATE_ATTEMPTS,
+    Math.max(safeRequested + 2, safeRequested * 3)
   );
   return Math.min(Math.max(0, Number(poolCount) || 0), desired);
+}
+
+function isConstrainedAutoplayRuntime() {
+  try {
+    const ua = String(navigator?.userAgent || "");
+    const uaMobile = /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+    const isWV = /\bwv\b|Crosswalk/i.test(ua);
+    const hasBridge = !!(window.cordova || window.Capacitor || window.ReactNativeWebView);
+    return !!(isWV || hasBridge || uaMobile);
+  } catch {
+    return false;
+  }
 }
 
 function markTrailersAsShown(items = [], cacheKey = "default") {
@@ -790,20 +1263,42 @@ function ensureOverlayStyle() {
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
+      justify-content: center;
     }
     .monwui-cinema-preroll__button {
+      align-items: center;
       appearance: none;
       border: none;
       border-radius: 999px;
+      display: inline-flex;
+      gap: 8px;
+      justify-content: center;
       padding: 12px 18px;
       font-size: 13px;
       font-weight: 700;
       letter-spacing: .03em;
       cursor: pointer;
       transition: transform .18s ease, opacity .18s ease, background-color .18s ease;
+      white-space: nowrap;
     }
     .monwui-cinema-preroll__button:hover {
       transform: translateY(-1px);
+    }
+    .monwui-cinema-preroll__button:disabled {
+      cursor: wait;
+      opacity: .72;
+      transform: none;
+    }
+    .monwui-cinema-preroll__button.is-requested,
+    .monwui-cinema-preroll__button.is-requested:disabled {
+      background: rgba(34,197,94,.18);
+      border-color: rgba(74,222,128,.36);
+      color: #bbf7d0;
+      cursor: default;
+      opacity: 1;
+    }
+    button.monwui-cinema-preroll__button.monwui-cinema-preroll__button--ghost.is-requested span {
+      display: none;
     }
     .monwui-cinema-preroll__button--primary {
       background: linear-gradient(135deg, #f3c275, #f8e0b2);
@@ -958,6 +1453,9 @@ function ensureOverlayDom({ immersive = false, sessionState = {} } = {}) {
           <div>
             <div class="monwui-cinema-preroll__actions">
               <button type="button" class="monwui-cinema-preroll__button monwui-cinema-preroll__button--primary" data-action="next">${labels.cinemaPreRollNextTrailer || "Next Trailer"}</button>
+              <button type="button" class="monwui-cinema-preroll__button monwui-cinema-preroll__button--ghost" data-action="serr-request" hidden>
+                <i class="fa-solid fa-clapperboard" aria-hidden="true"></i><span>${escapeAttribute(labels.serrRequestFromTrailer || labels.serrRequestButton || "İste")}</span>
+              </button>
               <button type="button" class="monwui-cinema-preroll__button monwui-cinema-preroll__button--ghost" data-action="skip">${labels.cinemaPreRollSkip || "Skip Trailers"}</button>
             </div>
           </div>
@@ -975,6 +1473,7 @@ function ensureOverlayDom({ immersive = false, sessionState = {} } = {}) {
   });
   const fullscreenButton = overlay.querySelector('[data-action="fullscreen"]');
   const panelToggleButton = overlay.querySelector('[data-action="panel-toggle"]');
+  const serrRequestButton = overlay.querySelector('[data-action="serr-request"]');
   const onFullscreenChange = () => updateFullscreenButtonState(overlay);
   fullscreenButton?.addEventListener("click", (event) => {
     event.preventDefault();
@@ -985,6 +1484,11 @@ function ensureOverlayDom({ immersive = false, sessionState = {} } = {}) {
     event.preventDefault();
     event.stopPropagation();
     toggleCinemaPanel(overlay);
+  });
+  serrRequestButton?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void submitCinemaSerrRequest(overlay);
   });
   [
     "fullscreenchange",
@@ -1003,6 +1507,8 @@ function ensureOverlayDom({ immersive = false, sessionState = {} } = {}) {
     ].forEach((eventName) => {
       try { document.removeEventListener(eventName, onFullscreenChange); } catch {}
     });
+    restoreDocumentScroll();
+    if (currentOverlay === overlay) currentOverlay = null;
   };
   document.body.appendChild(overlay);
   updateFullscreenButtonState(overlay);
@@ -1167,6 +1673,8 @@ function setOverlayContent(overlay, trailer, index, total) {
   const overview = overlay.querySelector(".monwui-cinema-preroll__overview");
   const poster = overlay.querySelector(".monwui-cinema-preroll__poster");
 
+  overlay.__jmsCinemaPreRollCurrentTrailer = trailer || null;
+
   if (bg) {
     bg.style.backgroundImage = trailer?.backdropUrl
       ? `url("${trailer.backdropUrl}")`
@@ -1198,6 +1706,8 @@ function setOverlayContent(overlay, trailer, index, total) {
       poster.style.visibility = "hidden";
     }
   }
+
+  void refreshCinemaSerrButtonForTrailer(overlay, trailer);
 }
 
 async function playSingleTrailer(overlay, trailer, index, total, sessionState = {}) {
@@ -1213,6 +1723,7 @@ async function playSingleTrailer(overlay, trailer, index, total, sessionState = 
     let playbackConfirmed = false;
     let watchdogId = 0;
     const qualityTimerIds = new Set();
+    let autoplayAttempted = false;
 
     const scheduleQualityEnforcement = (targetPlayer, delays = TRAILER_QUALITY_RETRY_DELAYS_MS) => {
       if (!targetPlayer) return;
@@ -1244,13 +1755,17 @@ async function playSingleTrailer(overlay, trailer, index, total, sessionState = 
       settled = true;
       const played = options.played === true || playbackConfirmed === true;
       cleanup();
-      resolve({ action, played });
+      resolve({
+        action,
+        played,
+        userAdvanced: options.userAdvanced === true
+      });
     };
 
     const nextButton = overlay.querySelector('[data-action="next"]');
     const skipButton = overlay.querySelector('[data-action="skip"]');
 
-    const onNextClick = () => finish("next");
+    const onNextClick = () => finish("next", { played: playbackConfirmed, userAdvanced: true });
     const onSkipClick = () => finish("skip");
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
@@ -1258,15 +1773,45 @@ async function playSingleTrailer(overlay, trailer, index, total, sessionState = 
         finish("skip");
       }
     };
+
+    const constrainedAutoplay = isConstrainedAutoplayRuntime();
+    let userUnmuted = !constrainedAutoplay;
+
+    const attemptAutoplay = (playerInstance, { allowUnmute = false } = {}) => {
+      if (autoplayAttempted && !allowUnmute) return;
+      autoplayAttempted = true;
+
+      try {
+        if (constrainedAutoplay && !allowUnmute) {
+          playerInstance.mute?.();
+        } else {
+          playerInstance.unMute?.();
+          userUnmuted = true;
+          playerInstance.setVolume?.(100);
+        }
+        playerInstance.playVideo?.();
+        scheduleQualityEnforcement(playerInstance, [0, 600]);
+
+        setTimeout(() => {
+          if (!playbackConfirmed && playerInstance && !settled) {
+            try { playerInstance.playVideo?.(); } catch {}
+          }
+        }, 500);
+      } catch {}
+    };
+
     const onPointerDown = (event) => {
       if (event?.target?.closest?.('[data-action], .monwui-cinema-preroll__overviewToggle')) return;
       void maybeEnterTrailerFullscreen(overlay, sessionState);
-      try {
-        player?.unMute?.();
-        player?.setVolume?.(100);
-        player?.playVideo?.();
-        scheduleQualityEnforcement(player, [0, 600]);
-      } catch {}
+      if (player && !playbackConfirmed) {
+        attemptAutoplay(player, { allowUnmute: true });
+      } else if (player && constrainedAutoplay && !userUnmuted) {
+        try {
+          player.unMute?.();
+          player.setVolume?.(100);
+          userUnmuted = true;
+        } catch {}
+      }
     };
 
     nextButton?.addEventListener("click", onNextClick);
@@ -1277,7 +1822,7 @@ async function playSingleTrailer(overlay, trailer, index, total, sessionState = 
     overlay.focus({ preventScroll: true });
 
     watchdogId = window.setTimeout(() => {
-      if (!playbackConfirmed) finish("unplayable", { played: false });
+      if (!playbackConfirmed) finish("next", { played: false });
     }, PLAYER_WATCHDOG_MS);
 
     try {
@@ -1292,24 +1837,25 @@ async function playSingleTrailer(overlay, trailer, index, total, sessionState = 
           modestbranding: 1,
           playsinline: 1,
           enablejsapi: 1,
+          mute: constrainedAutoplay ? 1 : 0,
           vq: "hd720",
           origin: window.location.origin
         },
         events: {
           onReady(event) {
-            try {
-              event.target.unMute?.();
-              event.target.setVolume?.(100);
-              enforceMinimumTrailerQuality(event.target);
-              scheduleQualityEnforcement(event.target);
-              event.target.playVideo?.();
-            } catch {}
+            attemptAutoplay(event.target);
           },
           onStateChange(event) {
-            if (event.data === window.YT.PlayerState.PLAYING) {
+            const state = event?.data;
+            const states = window.YT?.PlayerState || {};
+            if (
+              state === states.PLAYING ||
+              state === states.BUFFERING ||
+              (constrainedAutoplay && state === states.CUED)
+            ) {
               playbackConfirmed = true;
               scheduleQualityEnforcement(event.target, [0, 900, 2200]);
-            } else if (event.data === window.YT.PlayerState.ENDED) {
+            } else if (state === states.ENDED) {
               finish("ended", { played: true });
             }
           },
@@ -1549,6 +2095,10 @@ async function resolveNativePlaybackItem(context = {}) {
   const itemId = context?.itemId || getItemId(candidate);
   if (!itemId) return candidate || null;
 
+  if (candidate && getItemId(candidate)) {
+    return candidate;
+  }
+
   const fetched = await fetchNativePlaybackItemDetails(itemId);
   if (fetched) return fetched;
   return candidate || { Id: itemId };
@@ -1563,6 +2113,17 @@ function shouldSkipNativePlaybackHook(context = {}) {
   const itemId = context?.itemId || getItemId(context?.item);
   if (!itemId) return true;
   return wasNativePreRollRecentlyAttempted(itemId);
+}
+
+function getActiveNativePlaybackGate(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id || !nativePlaybackGate?.promise) return null;
+  if (nativePlaybackGate.itemId !== id) return null;
+  if (Date.now() - Number(nativePlaybackGate.startedAt || 0) > NATIVE_PLAYBACK_DEDUPE_MS) {
+    nativePlaybackGate = null;
+    return null;
+  }
+  return nativePlaybackGate.promise;
 }
 
 function callOriginalNativePlay(original, target, args, { chainBypassMs = 0 } = {}) {
@@ -1583,6 +2144,21 @@ function callOriginalNativePlay(original, target, args, { chainBypassMs = 0 } = 
 
 async function runNativePreRollBeforePlay(original, target, args, label) {
   const context = extractNativePlaybackContext(args);
+  if (nativePlaybackHookBypassDepth > 0 || Date.now() < nativePlaybackHookBypassUntil) {
+    return callOriginalNativePlay(original, target, args);
+  }
+  try {
+    if (window.__jmsCinemaPreRollNativeHookBypass === true) {
+      return callOriginalNativePlay(original, target, args);
+    }
+  } catch {}
+
+  const contextItemId = context.itemId || getItemId(context.item);
+  const existingContextGate = getActiveNativePlaybackGate(contextItemId);
+  if (existingContextGate) {
+    return existingContextGate;
+  }
+
   if (shouldSkipNativePlaybackHook(context)) {
     return callOriginalNativePlay(original, target, args);
   }
@@ -1596,17 +2172,41 @@ async function runNativePreRollBeforePlay(original, target, args, label) {
     return callOriginalNativePlay(original, target, args);
   }
 
-  markNativePreRollAttemptIds(context.itemId, itemId);
-  try {
-    await maybePlayCinemaPreRollSession({ item, source: "native-playback-manager" });
-  } catch (error) {
-    console.warn(`[JMSFusion] Cinema pre-roll native hook skipped (${label || "playbackManager"}):`, error);
+  const existingGate = getActiveNativePlaybackGate(itemId);
+  if (existingGate) {
+    return existingGate;
   }
 
-  markNativePreRollAttemptIds(context.itemId, itemId);
-  return callOriginalNativePlay(original, target, args, {
-    chainBypassMs: NATIVE_PLAYBACK_CHAIN_BYPASS_MS
-  });
+  const gatePromise = (async () => {
+    markNativePreRollAttemptIds(context.itemId, itemId);
+    try {
+      const preRollResult = await maybePlayCinemaPreRollSession({ item, source: "native-playback-manager" });
+      if (preRollResult?.reason === "session-active") {
+        return false;
+      }
+    } catch (error) {
+      console.warn(`[JMSFusion] Cinema pre-roll native hook skipped (${label || "playbackManager"}):`, error);
+    }
+
+    markNativePreRollAttemptIds(context.itemId, itemId);
+    return callOriginalNativePlay(original, target, args, {
+      chainBypassMs: NATIVE_PLAYBACK_CHAIN_BYPASS_MS
+    });
+  })();
+
+  nativePlaybackGate = {
+    itemId,
+    promise: gatePromise,
+    startedAt: Date.now()
+  };
+
+  try {
+    return await gatePromise;
+  } finally {
+    if (nativePlaybackGate?.promise === gatePromise) {
+      nativePlaybackGate = null;
+    }
+  }
 }
 
 function patchNativePlaybackManager(target, label) {
@@ -1615,6 +2215,29 @@ function patchNativePlaybackManager(target, label) {
   if (target.play?.__jmsCinemaPreRollWrapped === true) {
     nativePlaybackHookPatchedTargets.add(target);
     return false;
+  }
+
+  if (target.play?.__jmsParentalPinWrapped === true) {
+    const parentalWrapped = target.play;
+    const innerPlay = parentalWrapped.__jmsParentalPinOriginalPlay;
+    if (!innerPlay || innerPlay.__jmsCinemaPreRollWrapped === true) {
+      nativePlaybackHookPatchedTargets.add(target);
+      return false;
+    }
+
+    const cinemaWrapped = function cinemaPreRollWrappedNativePlay(...args) {
+      return runNativePreRollBeforePlay(innerPlay, target, args, label);
+    };
+
+    try {
+      Object.defineProperty(cinemaWrapped, "__jmsCinemaPreRollWrapped", { value: true });
+      Object.defineProperty(cinemaWrapped, "__jmsCinemaPreRollOriginal", { value: innerPlay });
+      parentalWrapped.__jmsParentalPinOriginalPlay = cinemaWrapped;
+      nativePlaybackHookPatchedTargets.add(target);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   const original = target.play;
@@ -1680,17 +2303,31 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
       resumeTicks: Number(item?.UserData?.PlaybackPositionTicks || 0)
     };
   }
-  if (cinemaPreRollSessionActive) {
-    return { played: false, reason: "session-active" };
+  if (cinemaPreRollSessionPromise) {
+    return {
+      played: false,
+      reason: "session-active",
+      itemId: cinemaPreRollSessionItemId
+    };
   }
-  markNativePreRollAttempt(getItemId(item));
+
+  const sessionItemId = getItemId(item);
+  cinemaPreRollSessionActive = true;
+  cinemaPreRollSessionItemId = sessionItemId;
+
+  const sessionPromise = (async () => {
+  markNativePreRollAttempt(sessionItemId);
 
   const count = clampTrailerCount(runtimeConfig?.cinemaPreRollTrailerCount);
   const locale = resolveCinemaPreRollLocale(runtimeConfig);
-  const queueSource = await fetchNowPlayingTrailerPool().catch((error) => {
-    console.warn("[JMSFusion] Cinema pre-roll TMDb fetch failed:", error);
-    return [];
-  });
+  const runtimeCacheKey = buildTrailerRuntimeCacheKey(locale);
+  const [queueSource, ytReady] = await Promise.all([
+    fetchNowPlayingTrailerPool().catch((error) => {
+      console.warn("[JMSFusion] Cinema pre-roll TMDb fetch failed:", error);
+      return [];
+    }),
+    ensureYouTubeApi().catch(() => false)
+  ]);
   if (!queueSource.length) {
     return { played: false, reason: "empty", locale: locale.cacheKey, requestedCount: count };
   }
@@ -1698,7 +2335,7 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
   const sessionConsumedIds = new Set();
   const sessionConsumedTrailers = [];
   let userSkipped = false;
-  const candidateQueue = buildTrailerCandidateQueue(queueSource, locale.cacheKey)
+  const candidateQueue = buildTrailerCandidateQueue(queueSource, runtimeCacheKey)
     .slice(0, getTrailerCandidateAttemptLimit(count, queueSource.length));
   if (!candidateQueue.length) {
     return {
@@ -1709,8 +2346,6 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
       poolCount: queueSource.length
     };
   }
-
-  const ytReady = await ensureYouTubeApi().catch(() => false);
   if (!ytReady) {
     return {
       played: false,
@@ -1728,19 +2363,16 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
   let overlay = null;
   let shownCount = 0;
   const shownTrailers = [];
-  const previousBodyOverflow = document.body?.style?.overflow || "";
-  const previousHtmlOverflow = document.documentElement?.style?.overflow || "";
-  let overflowLocked = false;
 
   const ensureSessionOverlay = async () => {
-    if (overlay) return overlay;
+    if (overlay && overlay.isConnected) return overlay;
     await closeDetailsModalIfLoaded().catch(() => null);
+
+    if (overlay && !overlay.isConnected) overlay = null;
+
     overlay = ensureOverlayDom({ immersive: sessionState.prefersFullscreen, sessionState });
-    try {
-      if (document.body) document.body.style.overflow = "hidden";
-      if (document.documentElement) document.documentElement.style.overflow = "hidden";
-      overflowLocked = true;
-    } catch {}
+    lockDocumentScroll();
+    currentOverlay = overlay;
     await maybeEnterTrailerFullscreen(overlay, sessionState).catch(() => false);
     return overlay;
   };
@@ -1757,15 +2389,21 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
       if (shownCount >= count || userSkipped) break;
 
       rememberConsumedTrailer(trailer);
-      const playable = await probeYouTubeTrailerPlayable(trailer).catch(() => false);
-      if (!playable) continue;
+      if (!SKIP_TRAILER_PLAYABILITY_PROBE) {
+        const playable = await probeYouTubeTrailerPlayable(trailer).catch(() => false);
+        if (!playable) continue;
+      }
 
       const activeOverlay = await ensureSessionOverlay();
       const result = await playSingleTrailer(activeOverlay, trailer, shownCount, count, sessionState);
-      if (result?.played === true) {
+
+      if (result?.played === true || result?.userAdvanced === true) {
         shownTrailers.push(trailer);
         shownCount += 1;
+      } else if (result?.action === "next") {
+        continue;
       }
+
       if (result?.action === "skip") {
         userSkipped = true;
         break;
@@ -1778,8 +2416,8 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
     await tryTrailerQueue(candidateQueue);
 
     if (shownCount < count && !userSkipped && sessionConsumedTrailers.length) {
-      markTrailersAsShown(sessionConsumedTrailers, locale.cacheKey);
-      const retryQueue = buildTrailerCandidateQueue(queueSource, locale.cacheKey, {
+      markTrailersAsShown(sessionConsumedTrailers, runtimeCacheKey);
+      const retryQueue = buildTrailerCandidateQueue(queueSource, runtimeCacheKey, {
         excludeIds: sessionConsumedIds,
         allowReset: true
       }).slice(0, getTrailerCandidateAttemptLimit(count - shownCount, queueSource.length));
@@ -1791,17 +2429,13 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
       await exitElementFullscreenIfNeeded(overlay).catch(() => false);
       try { overlay.__jmsCinemaPreRollCleanup?.(); } catch {}
       try { overlay.remove(); } catch {}
+      currentOverlay = null;
     }
-    if (overflowLocked) {
-      try {
-        if (document.body) document.body.style.overflow = previousBodyOverflow;
-        if (document.documentElement) document.documentElement.style.overflow = previousHtmlOverflow;
-      } catch {}
-    }
+    restoreDocumentScroll();
     cinemaPreRollSessionActive = false;
   }
 
-  markTrailersAsShown(sessionConsumedTrailers, locale.cacheKey);
+  markTrailersAsShown(sessionConsumedTrailers, runtimeCacheKey);
   return {
     played: shownCount > 0,
     shownCount,
@@ -1810,6 +2444,36 @@ export async function maybePlayCinemaPreRollSession({ item } = {}) {
     poolCount: queueSource.length,
     attemptedCount: candidateQueue.length
   };
+  })();
+
+  cinemaPreRollSessionPromise = sessionPromise;
+
+  try {
+    return await sessionPromise;
+  } finally {
+    if (cinemaPreRollSessionPromise === sessionPromise) {
+      cinemaPreRollSessionPromise = null;
+      cinemaPreRollSessionItemId = "";
+      cinemaPreRollSessionActive = false;
+    }
+  }
 }
 
 installNativePlaybackHook();
+
+function warmupCinemaPreRollRuntime() {
+  try {
+    const runtimeConfig = getConfig() || {};
+    if (runtimeConfig?.cinemaPreRollEnabled !== true) return;
+    void fetchNowPlayingTrailerPool().catch(() => null);
+    void ensureYouTubeApi().catch(() => false);
+  } catch {}
+}
+
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", warmupCinemaPreRollRuntime, { once: true });
+  } else {
+    warmupCinemaPreRollRuntime();
+  }
+}

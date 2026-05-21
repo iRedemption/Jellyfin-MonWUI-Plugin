@@ -1,12 +1,16 @@
 using System.Collections.Concurrent;
+using System.Collections;
+using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Reflection;
+using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
-using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.JMSFusion.Controllers;
 
@@ -28,10 +32,12 @@ public class ParentalPinController : ControllerBase
     private static readonly Regex PinRegex = new(@"^\d{4,8}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly ConcurrentDictionary<string, ParentalPinAccessState> AccessStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly IUserManager _users;
+    private readonly ILogger<ParentalPinController> _logger;
 
-    public ParentalPinController(IUserManager users)
+    public ParentalPinController(IUserManager users, ILogger<ParentalPinController> logger)
     {
         _users = users;
+        _logger = logger;
     }
 
     private sealed class ParentalPinAccessState
@@ -55,6 +61,11 @@ public class ParentalPinController : ControllerBase
         string UserName,
         long LockedUntilUtc,
         int RemainingMinutes);
+
+    private sealed record KnownUser(
+        string UserId,
+        string UserName,
+        bool IsAdmin);
 
     public sealed class SaveSettingsRequest
     {
@@ -101,25 +112,32 @@ public class ParentalPinController : ControllerBase
     [HttpGet("settings")]
     public IActionResult GetSettings()
     {
-        var adminCheck = TryGetAdminUser();
-        if (adminCheck.Result is not null)
+        try
         {
-            return adminCheck.Result;
-        }
+            var adminCheck = TryGetAdminUser();
+            if (adminCheck.Result is not null)
+            {
+                return adminCheck.Result;
+            }
 
-        var plugin = JMSFusionPlugin.Instance ?? throw new InvalidOperationException("Plugin not available.");
-        var cfg = plugin.Configuration;
-        var users = GetKnownUsers();
-        var sanitizedRules = SanitizeRules(cfg.ParentalPinRules, users, out var rulesChanged);
-        cfg.ParentalPinRules = sanitizedRules;
-        var securityChanged = NormalizeSecuritySettings(cfg);
-        if (rulesChanged || securityChanged)
+            var plugin = JMSFusionPlugin.Instance ?? throw new InvalidOperationException("Plugin not available.");
+            var cfg = plugin.Configuration;
+            var users = GetKnownUsers();
+            var sanitizedRules = SanitizeRules(cfg.ParentalPinRules, users, out var rulesChanged);
+            cfg.ParentalPinRules = sanitizedRules;
+            var securityChanged = NormalizeSecuritySettings(cfg);
+            if (rulesChanged || securityChanged)
+            {
+                plugin.UpdateConfiguration(cfg);
+            }
+
+            NoCache();
+            return Ok(BuildSettingsResponse(cfg, users, sanitizedRules));
+        }
+        catch (Exception ex)
         {
-            plugin.UpdateConfiguration(cfg);
+            return InternalError(ex);
         }
-
-        NoCache();
-        return Ok(BuildSettingsResponse(cfg, users, sanitizedRules));
     }
 
     [HttpPost("settings")]
@@ -470,20 +488,65 @@ public class ParentalPinController : ControllerBase
         }
     }
 
-    private Dictionary<string, User> GetKnownUsers()
+    private Dictionary<string, KnownUser> GetKnownUsers()
     {
-        var map = new Dictionary<string, User>(StringComparer.OrdinalIgnoreCase);
-        foreach (var user in _users.Users)
+        var map = new Dictionary<string, KnownUser>(StringComparer.OrdinalIgnoreCase);
+        AddKnownUsersFromSource(map, TryGetUsersSource());
+
+        if (map.Count == 0)
         {
-            if (user is null || user.Id == Guid.Empty)
+            AddKnownUsersFromIds(map, TryGetUserIdsSource());
+        }
+
+        return map;
+    }
+
+    private object? TryGetUsersSource()
+        => TryGetMemberValue(_users, "Users", "GetUsers", "GetAllUsers");
+
+    private object? TryGetUserIdsSource()
+        => TryGetMemberValue(_users, "UsersIds", "UserIds", "GetUsersIds", "GetUserIds");
+
+    private void AddKnownUsersFromSource(IDictionary<string, KnownUser> map, object? usersSource)
+    {
+        if (usersSource is not IEnumerable users)
+        {
+            return;
+        }
+
+        foreach (var user in users)
+        {
+            AddKnownUser(map, user);
+        }
+    }
+
+    private void AddKnownUsersFromIds(IDictionary<string, KnownUser> map, object? userIdsSource)
+    {
+        if (userIdsSource is not IEnumerable userIds)
+        {
+            return;
+        }
+
+        foreach (var value in userIds)
+        {
+            if (!Guid.TryParse(value?.ToString(), out var userId) || userId == Guid.Empty)
             {
                 continue;
             }
 
-            map[user.Id.ToString("D")] = user;
+            AddKnownUser(map, TryGetUserById(userId));
+        }
+    }
+
+    private static void AddKnownUser(IDictionary<string, KnownUser> map, object? user)
+    {
+        var userId = NormalizeUserId(TryGetPropertyValue(user, "Id", "UserId")?.ToString());
+        if (string.IsNullOrWhiteSpace(userId))
+        {
+            return;
         }
 
-        return map;
+        map[userId] = new KnownUser(userId, GetUserName(user), IsAdminUser(user));
     }
 
     private static object ToRuleResponse(ParentalPinRuleEntry entry)
@@ -498,7 +561,7 @@ public class ParentalPinController : ControllerBase
 
     private object BuildSettingsResponse(
         JMSFusionConfiguration cfg,
-        IReadOnlyDictionary<string, User> users,
+        IReadOnlyDictionary<string, KnownUser> users,
         IReadOnlyList<ParentalPinRuleEntry> rules,
         string? unlockedUserId = null)
     {
@@ -523,12 +586,12 @@ public class ParentalPinController : ControllerBase
             lockoutMinutes = cfg.ParentalPinLockoutMinutes,
             trustMinutes = cfg.ParentalPinTrustMinutes,
             users = users.Values
-                .OrderBy(user => user.Username, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(user => user.UserName, StringComparer.OrdinalIgnoreCase)
                 .Select(user => new UserDto
                 {
-                    UserId = user.Id.ToString("D"),
-                    UserName = user.Username ?? "User",
-                    IsAdmin = IsAdminUser(user)
+                    UserId = user.UserId,
+                    UserName = user.UserName,
+                    IsAdmin = user.IsAdmin
                 })
                 .ToList(),
             lockStates,
@@ -538,7 +601,7 @@ public class ParentalPinController : ControllerBase
 
     private static List<ParentalPinRuleEntry> SanitizeRules(
         IEnumerable<ParentalPinRuleEntry>? rules,
-        IReadOnlyDictionary<string, User> users,
+        IReadOnlyDictionary<string, KnownUser> users,
         out bool changed)
     {
         changed = false;
@@ -575,7 +638,7 @@ public class ParentalPinController : ControllerBase
                 continue;
             }
 
-            var userName = user.Username ?? "User";
+            var userName = user.UserName;
             var updatedAtUtc = rule?.UpdatedAtUtc ?? 0;
             if (updatedAtUtc <= 0)
             {
@@ -676,7 +739,7 @@ public class ParentalPinController : ControllerBase
         => value < MinTrustMinutes ? DefaultTrustMinutes : Math.Clamp(value, MinTrustMinutes, MaxTrustMinutes);
 
     private static List<LockedUserSnapshot> GetLockedUserSnapshots(
-        IReadOnlyDictionary<string, User> users,
+        IReadOnlyDictionary<string, KnownUser> users,
         int maxAttempts)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -705,7 +768,7 @@ public class ParentalPinController : ControllerBase
 
             output.Add(new LockedUserSnapshot(
                 userId,
-                user.Username ?? "User",
+                user.UserName,
                 snapshot.LockedUntilUtc,
                 GetRemainingLockMinutes(snapshot.LockedUntilUtc, now)));
         }
@@ -845,7 +908,7 @@ public class ParentalPinController : ControllerBase
     private static AccessSnapshot CreateEmptyAccessSnapshot(int maxAttempts)
         => new(false, 0, false, 0, Math.Max(0, maxAttempts));
 
-    private (User? User, Guid UserId, IActionResult? Result) TryGetAdminUser()
+    private (object? User, Guid UserId, IActionResult? Result) TryGetAdminUser()
     {
         var userCheck = TryGetRequestUser();
         if (userCheck.Result is not null)
@@ -866,7 +929,7 @@ public class ParentalPinController : ControllerBase
         return userCheck;
     }
 
-    private (User? User, Guid UserId, IActionResult? Result) TryGetRequestUser()
+    private (object? User, Guid UserId, IActionResult? Result) TryGetRequestUser()
     {
         if (!TryGetRequestUserId(out var userId))
         {
@@ -878,7 +941,7 @@ public class ParentalPinController : ControllerBase
             }));
         }
 
-        var user = _users.GetUserById(userId);
+        var user = TryGetUserById(userId) ?? FindUserByIdInSources(userId);
         if (user is null)
         {
             return (null, Guid.Empty, Unauthorized(new
@@ -892,24 +955,376 @@ public class ParentalPinController : ControllerBase
         return (user, userId, null);
     }
 
-    private bool TryGetRequestUserId(out Guid userId)
+    private object? TryGetUserById(Guid userId)
     {
-        var userIdHeader =
-            Request.Headers["X-Emby-UserId"].FirstOrDefault()
-            ?? Request.Headers["X-MediaBrowser-UserId"].FirstOrDefault();
+        try
+        {
+            var method = _users.GetType()
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .FirstOrDefault(candidate =>
+                {
+                    if (!NameMatches(candidate.Name, "GetUserById", "GetUser", "GetUserByIdAsync", "GetUserAsync"))
+                    {
+                        return false;
+                    }
 
-        return Guid.TryParse(userIdHeader, out userId) && userId != Guid.Empty;
+                    var parameters = candidate.GetParameters();
+                    return parameters.Length == 1
+                        && (parameters[0].ParameterType == typeof(Guid)
+                            || parameters[0].ParameterType == typeof(string));
+                });
+
+            if (method is null)
+            {
+                return null;
+            }
+
+            var parameterType = method.GetParameters()[0].ParameterType;
+            object argument = parameterType == typeof(Guid) ? userId : userId.ToString("D");
+            return UnwrapTaskResult(method.Invoke(_users, [argument]));
+        }
+        catch
+        {
+            return null;
+        }
     }
 
-    private static bool IsAdminUser(User? user)
+    private object? FindUserByIdInSources(Guid userId)
+    {
+        var normalizedUserId = userId.ToString("D");
+        if (TryGetUsersSource() is not IEnumerable users)
+        {
+            return null;
+        }
+
+        foreach (var user in users)
+        {
+            var candidateId = NormalizeUserId(TryGetPropertyValue(user, "Id", "UserId")?.ToString());
+            if (string.Equals(candidateId, normalizedUserId, StringComparison.OrdinalIgnoreCase))
+            {
+                return user;
+            }
+        }
+
+        return null;
+    }
+
+    private bool TryGetRequestUserId(out Guid userId)
+    {
+        foreach (var candidate in new[]
+        {
+            Request.Headers["X-Emby-UserId"].FirstOrDefault(),
+            Request.Headers["X-MediaBrowser-UserId"].FirstOrDefault(),
+            Request.Query["userId"].FirstOrDefault(),
+            Request.Query["UserId"].FirstOrDefault(),
+            TryGetUserIdFromClaims(),
+            TryGetUserIdFromAuthorizationHeader()
+        })
+        {
+            if (Guid.TryParse(candidate, out userId) && userId != Guid.Empty)
+            {
+                return true;
+            }
+        }
+
+        userId = Guid.Empty;
+        return false;
+    }
+
+    private string? TryGetUserIdFromClaims()
+    {
+        var claimTypes = new[]
+        {
+            ClaimTypes.NameIdentifier,
+            "JellyfinUserId",
+            "UserId",
+            "user_id",
+            "sub"
+        };
+
+        foreach (var claimType in claimTypes)
+        {
+            var claimValue = HttpContext?.User?.FindFirst(claimType)?.Value;
+            if (!string.IsNullOrWhiteSpace(claimValue))
+            {
+                return claimValue;
+            }
+        }
+
+        return null;
+    }
+
+    private string? TryGetUserIdFromAuthorizationHeader()
+    {
+        var authorization =
+            Request.Headers["X-Emby-Authorization"].FirstOrDefault() ??
+            Request.Headers["Authorization"].FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(authorization))
+        {
+            return null;
+        }
+
+        const string quotedMarker = "UserId=\"";
+        var quotedIndex = authorization.IndexOf(quotedMarker, StringComparison.OrdinalIgnoreCase);
+        if (quotedIndex >= 0)
+        {
+            var start = quotedIndex + quotedMarker.Length;
+            var end = authorization.IndexOf('"', start);
+            if (end > start)
+            {
+                return authorization[start..end];
+            }
+        }
+
+        const string plainMarker = "UserId=";
+        var plainIndex = authorization.IndexOf(plainMarker, StringComparison.OrdinalIgnoreCase);
+        if (plainIndex >= 0)
+        {
+            var start = plainIndex + plainMarker.Length;
+            var tail = authorization[start..];
+            var end = tail.IndexOf(',');
+            return (end >= 0 ? tail[..end] : tail).Trim().Trim('"');
+        }
+
+        return null;
+    }
+
+    private static bool IsAdminUser(object? user)
     {
         if (user is null)
         {
             return false;
         }
 
-        return user.Permissions.Any(permission =>
-            permission.Kind == PermissionKind.IsAdministrator && permission.Value);
+        var directAdmin = TryReadBoolProperty(user, "IsAdministrator", "IsAdmin");
+        if (directAdmin == true)
+        {
+            return true;
+        }
+
+        var policy = TryGetPropertyValue(user, "Policy", "UserPolicy");
+        var policyAdmin = TryReadBoolProperty(policy, "IsAdministrator", "IsAdmin");
+        if (policyAdmin == true)
+        {
+            return true;
+        }
+
+        if (TryInvokeHasPermission(user, "IsAdministrator", out var hasPermission))
+        {
+            return hasPermission;
+        }
+
+        return TryReadPermissionsCollection(user, "IsAdministrator");
+    }
+
+    private static string GetUserName(object? user)
+        => PickFirstString(
+            TryGetPropertyValue(user, "Username")?.ToString(),
+            TryGetPropertyValue(user, "Name")?.ToString(),
+            TryGetPropertyValue(user, "UserName")?.ToString(),
+            "User");
+
+    private static string PickFirstString(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            var normalized = (value ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(normalized))
+            {
+                return normalized;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static object? TryGetPropertyValue(object? target, params string[] names)
+    {
+        if (target is null)
+        {
+            return null;
+        }
+
+        var type = target.GetType();
+        foreach (var name in names)
+        {
+            try
+            {
+                var property = type
+                    .GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(candidate => NameMatches(candidate.Name, name));
+                if (property is not null)
+                {
+                    return UnwrapTaskResult(property.GetValue(target));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
+    }
+
+    private static object? TryGetMemberValue(object? target, params string[] names)
+    {
+        var propertyValue = TryGetPropertyValue(target, names);
+        if (propertyValue is not null)
+        {
+            return propertyValue;
+        }
+
+        if (target is null)
+        {
+            return null;
+        }
+
+        var type = target.GetType();
+        foreach (var name in names)
+        {
+            try
+            {
+                var method = type
+                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(candidate =>
+                        NameMatches(candidate.Name, name) &&
+                        candidate.GetParameters().Length == 0);
+                if (method is not null)
+                {
+                    return UnwrapTaskResult(method.Invoke(target, []));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
+    }
+
+    private static bool NameMatches(string candidate, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase) ||
+                candidate.EndsWith("." + name, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static object? UnwrapTaskResult(object? value)
+    {
+        if (value is not Task task)
+        {
+            return value;
+        }
+
+        try
+        {
+            task.GetAwaiter().GetResult();
+            return TryGetPropertyValue(task, "Result");
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool? TryReadBoolProperty(object? target, params string[] names)
+    {
+        var value = TryGetPropertyValue(target, names);
+        if (value is bool flag)
+        {
+            return flag;
+        }
+
+        if (value is not null && bool.TryParse(value.ToString(), out var parsed))
+        {
+            return parsed;
+        }
+
+        return null;
+    }
+
+    private static bool TryInvokeHasPermission(object user, string permissionName, out bool isAllowed)
+    {
+        isAllowed = false;
+
+        try
+        {
+            var method = user.GetType()
+                .GetMethods()
+                .FirstOrDefault(candidate =>
+                {
+                    var parameters = candidate.GetParameters();
+                    return string.Equals(candidate.Name, "HasPermission", StringComparison.OrdinalIgnoreCase)
+                        && parameters.Length == 1;
+                });
+
+            if (method is null)
+            {
+                return false;
+            }
+
+            var parameterType = method.GetParameters()[0].ParameterType;
+            object? argument = null;
+            if (parameterType.IsEnum)
+            {
+                argument = Enum.Parse(parameterType, permissionName, ignoreCase: true);
+            }
+            else if (parameterType == typeof(string))
+            {
+                argument = permissionName;
+            }
+
+            if (argument is null)
+            {
+                return false;
+            }
+
+            var result = method.Invoke(user, [argument]);
+            if (result is bool flag)
+            {
+                isAllowed = flag;
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool TryReadPermissionsCollection(object user, string permissionName)
+    {
+        if (TryGetPropertyValue(user, "Permissions") is not IEnumerable permissions)
+        {
+            return false;
+        }
+
+        foreach (var permission in permissions)
+        {
+            if (permission is null)
+            {
+                continue;
+            }
+
+            var kind = TryGetPropertyValue(permission, "Kind", "Name", "PermissionKind")?.ToString();
+            var value = TryReadBoolProperty(permission, "Value", "Enabled", "IsEnabled") == true;
+            if (value && string.Equals(kind, permissionName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void NoCache()
@@ -917,5 +1332,17 @@ public class ParentalPinController : ControllerBase
         Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0";
         Response.Headers["Pragma"] = "no-cache";
         Response.Headers["Expires"] = "0";
+    }
+
+    private IActionResult InternalError(Exception ex)
+    {
+        _logger.LogError(ex, "[JMSFusion] Parental PIN settings failed.");
+        NoCache();
+        return StatusCode(500, new
+        {
+            ok = false,
+            code = "parental_pin_internal_error",
+            error = "Parental PIN settings could not be loaded."
+        });
     }
 }

@@ -7,6 +7,7 @@ let applySkinHeader = null;
 let homeTopLifecycleBound = false;
 let skinHeaderLifecycleBound = false;
 const SLIDER_HEADER_OFFSET_VAR = '--jms-slider-header-offset-px';
+const SLIDER_VISUAL_TOP_VAR = '--jms-slider-visual-top';
 
 const OBSERVER_OPTIONS = {
   subtree: true,
@@ -182,6 +183,26 @@ function findRepresentativeHomeTopTarget(affectFavoritesTab = true) {
   return getHomeTopTargets(affectFavoritesTab)[0] || null;
 }
 
+function findActiveSlidesContainer() {
+  return document.querySelector(
+    '#indexPage:not(.hide) #monwui-slides-container, #homePage:not(.hide) #monwui-slides-container, #monwui-slides-container'
+  );
+}
+
+function readSliderVisualTopValue() {
+  const container = findActiveSlidesContainer();
+  if (!container) return '0px';
+
+  const inlineValue = container.style?.getPropertyValue?.(SLIDER_VISUAL_TOP_VAR)?.trim();
+  if (inlineValue) return inlineValue;
+
+  try {
+    return window.getComputedStyle?.(container)?.getPropertyValue?.(SLIDER_VISUAL_TOP_VAR)?.trim() || '0px';
+  } catch {
+    return '0px';
+  }
+}
+
 function computeEffectiveTopState() {
   const cfg = (typeof getConfig === 'function') ? getConfig() : {};
   const userTop = readUserTopFromLocalStorage();
@@ -189,6 +210,7 @@ function computeEffectiveTopState() {
     return {
       topValue: `${userTop}vh`,
       usesHeaderOffset: false,
+      visualTopValue: '',
     };
   }
   if (cfg?.enableSlider === false || cfg?.enableSlider === 'false') {
@@ -201,9 +223,10 @@ function computeEffectiveTopState() {
 
   return {
     topValue: usesHeaderOffset
-      ? `calc(${baseTop}vh + var(${SLIDER_HEADER_OFFSET_VAR}, 0px))`
+      ? `calc(${baseTop}vh + var(${SLIDER_HEADER_OFFSET_VAR}, 0px) + var(${SLIDER_VISUAL_TOP_VAR}, 0px))`
       : `${baseTop}vh`,
     usesHeaderOffset,
+    visualTopValue: usesHeaderOffset ? readSliderVisualTopValue() : '',
   };
 }
 
@@ -212,15 +235,15 @@ function getDefaultTopByVariant(variant) {
   const mobile = window.matchMedia?.('(max-width: 768px)')?.matches || isMobileDevice();
   if (mobile) {
     switch (variant) {
-      case 'normalslider': baseTop = -6.5; break;
-      case 'peakslider': baseTop = -3; break;
-      case 'slider': baseTop = -1.5; break;
+      case 'normalslider': baseTop = -1; break;
+      case 'peakslider': baseTop = 0; break;
+      case 'slider': baseTop = 0; break;
       default: baseTop = 0; break;
     }
   } else {
     switch (variant) {
-      case 'normalslider': baseTop = -15; break;
-      case 'peakslider': baseTop = -2.5; break;
+      case 'normalslider': baseTop = -10; break;
+      case 'peakslider': baseTop = 0; break;
       case 'slider': baseTop = 1; break;
       default: baseTop = 0; break;
     }
@@ -254,10 +277,15 @@ function shouldAffectFavoritesTab(cfg) {
   return !coerceBoolean(cfg?.onlyShowSliderOnHomeTab, true);
 }
 
-function applyTopToElements(value, affectFavoritesTab = true) {
+function applyTopToElements(value, affectFavoritesTab = true, visualTopValue = '') {
   const targets = getHomeTopTargets(affectFavoritesTab);
   for (const el of targets) {
     if (!el) continue;
+    if (visualTopValue) {
+      el.style.setProperty(SLIDER_VISUAL_TOP_VAR, visualTopValue);
+    } else {
+      el.style.removeProperty(SLIDER_VISUAL_TOP_VAR);
+    }
     if (el.style.top !== value) {
       el.style.setProperty('top', value, 'important');
     }
@@ -269,6 +297,7 @@ function clearTopOverrides(affectFavoritesTab = true) {
   for (const el of targets) {
     if (!el) continue;
     el.style.removeProperty('top');
+    el.style.removeProperty(SLIDER_VISUAL_TOP_VAR);
   }
 }
 
@@ -276,9 +305,10 @@ function clearFavoritesTabTopOverride() {
   const el = document.querySelector('#favoritesTab');
   if (!el) return;
   el.style.removeProperty('top');
+  el.style.removeProperty(SLIDER_VISUAL_TOP_VAR);
 }
 
-function waitForFavoritesTabAndApply(topValue) {
+function waitForFavoritesTabAndApply(topValue, visualTopValue = '') {
   let tries = 0;
   function attempt() {
     const cfg = (typeof getConfig === 'function') ? getConfig() : {};
@@ -286,6 +316,11 @@ function waitForFavoritesTabAndApply(topValue) {
 
     const el = document.querySelector('#favoritesTab');
     if (el) {
+      if (visualTopValue) {
+        el.style.setProperty(SLIDER_VISUAL_TOP_VAR, visualTopValue);
+      } else {
+        el.style.removeProperty(SLIDER_VISUAL_TOP_VAR);
+      }
       el.style.setProperty('top', topValue, 'important');
       return;
     }
@@ -306,9 +341,9 @@ export function forceHomeSectionsTop() {
       return;
     }
 
-    applyTopToElements(topState.topValue, affectFavoritesTab);
+    applyTopToElements(topState.topValue, affectFavoritesTab, topState.visualTopValue);
     if (affectFavoritesTab) {
-      waitForFavoritesTabAndApply(topState.topValue);
+      waitForFavoritesTabAndApply(topState.topValue, topState.visualTopValue);
     } else {
       clearFavoritesTabTopOverride();
     }

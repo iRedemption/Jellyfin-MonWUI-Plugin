@@ -224,8 +224,11 @@ namespace Jellyfin.Plugin.JMSFusion
                 new PluginPageInfo
                 {
                     Name = "JMSFusionConfigPage",
+                    DisplayName = "JMSFusion",
                     EmbeddedResourcePath = $"{ns}.Web.configuration.html",
-                    EnableInMainMenu = false
+                    EnableInMainMenu = true,
+                    MenuSection = "server",
+                    MenuIcon = "extension"
                 }
             };
         }

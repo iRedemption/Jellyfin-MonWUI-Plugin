@@ -1,13 +1,14 @@
 import { getYoutubeEmbedUrl, getProviderUrl, isValidUrl, createTrailerIframe, debounce, getHighResImageUrls, prefetchImages, getHighestQualityBackdropIndex, createImageWarmQueue } from "./utils.js";
-import { updateFavoriteStatus, updatePlayedStatus, fetchItemDetails, getSessionInfo } from "../../Plugins/JMSFusion/runtime/api.js";
+import { updateFavoriteStatus, updatePlayedStatus, getSessionInfo } from "../../Plugins/JMSFusion/runtime/api.js";
 import { getConfig } from "./config.js";
 import { getLanguageLabels, getDefaultLanguage } from "../language/index.js";
-import { createSlidesContainer, createHorizontalGradientOverlay, createLogoContainer, createStatusContainer, createActorSlider, createInfoContainer, createDirectorContainer, createRatingContainer, createLanguageContainer, createMetaContainer, createMainContentContainer, createPlotContainer, createTitleContainer } from "./containerUtils.js";
+import { createSlidesContainer, createHorizontalGradientOverlay, createLogoContainer, createStatusContainer, createFormatContainer, createActorSlider, createInfoContainer, createDirectorContainer, createRatingContainer, createLanguageContainer, createMetaContainer, createMainContentContainer, createPlotContainer, createTitleContainer } from "./containerUtils.js";
 import { createButtons, createProviderContainer } from './buttons.js';
 import { withServer, withServerSrcset } from "./jfUrl.js";
 import { createTomatoIconElement } from "./customIcons.js";
 import { openDetailsModal } from "./detailsModalLoader.js";
 import { getWatchlistButtonText } from "./watchlist.js";
+import { fetchItemDetailsFromSliderCache } from "./sliderCache.js";
 
 const S = (u) => withServer(u);
 const config = getConfig();
@@ -361,7 +362,7 @@ async function createSlide(item, options = {}) {
 
   if ((item.Type === "Episode" || item.Type === "Season") && item.SeriesId) {
     try {
-      const parentItem = await fetchItemDetails(item.SeriesId);
+      const parentItem = await fetchItemDetailsFromSliderCache(item.SeriesId);
       parentId = parentItem.Id;
 
       const mergeTrailers = (a = [], b = []) => {
@@ -816,7 +817,12 @@ async function createSlide(item, options = {}) {
   IndexNumber: item.IndexNumber
 });
 
-  const statusContainer = createStatusContainer(itemType, config, UserData, ChildCount, RunTimeTicks, MediaStreams);
+  const metaColorSeed = String(
+    item?.Id || item?.Name || item?.BackdropImageTags?.[0] || Date.now()
+  );
+  slide.dataset.metaColorSeed = metaColorSeed;
+  const statusContainer = createStatusContainer(config, UserData, RunTimeTicks);
+  const formatContainer = createFormatContainer(itemType, config, ChildCount, MediaStreams, metaColorSeed);
   const actorSlider = await createActorSlider(People, config, item);
   const infoContainer = createInfoContainer({ config, Genres, ProductionYear, ProductionLocations });
   const directorContainer = await createDirectorContainer({ config, People, item });
@@ -831,17 +837,13 @@ async function createSlide(item, options = {}) {
   const providerContainer = createProviderContainer({ config, ProviderIds, RemoteTrailers, itemId, slide, item });
   const languageContainer = createLanguageContainer({ config, MediaStreams, itemType });
 
-  const metaColorSeed = String(
-    item?.Id || item?.Name || item?.BackdropImageTags?.[0] || Date.now()
-  );
-  slide.dataset.metaColorSeed = metaColorSeed;
   const metaContainer = createMetaContainer(metaColorSeed);
   if (statusContainer) metaContainer.appendChild(statusContainer);
   if (ratingExists) metaContainer.appendChild(ratingContainer);
   if (languageContainer) metaContainer.appendChild(languageContainer);
   const mainContentContainer = createMainContentContainer();
   mainContentContainer.append(logoContainer, titleContainer, plotContainer, providerContainer);
-  slide.append(metaContainer, mainContentContainer, buttonContainer, actorSlider, infoContainer, directorContainer);
+  slide.append(...[formatContainer, metaContainer, mainContentContainer, buttonContainer, actorSlider, infoContainer, directorContainer].filter(Boolean));
   const frag = document.createDocumentFragment();
   frag.appendChild(slide);
   const slideChildren = Array.from(slidesContainer.children).filter((child) => child.classList?.contains("monwui-slide"));

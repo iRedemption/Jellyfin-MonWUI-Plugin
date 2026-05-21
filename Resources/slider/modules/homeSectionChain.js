@@ -626,8 +626,13 @@ function getSectionCompletionEvents(key) {
   return [];
 }
 
-export function waitForManagedSectionReady(key, { timeoutMs = 20000 } = {}) {
-  if (!key || isSectionReadyForGate(key)) {
+export function waitForManagedSectionReady(key, {
+  timeoutMs = 20000,
+  allowTimeout = true,
+  isStillValid = null,
+} = {}) {
+  const isInvalid = () => (typeof isStillValid === "function" && !isStillValid());
+  if (!key || isSectionReadyForGate(key) || isInvalid()) {
     return Promise.resolve();
   }
 
@@ -647,6 +652,7 @@ export function waitForManagedSectionReady(key, { timeoutMs = 20000 } = {}) {
       for (const eventName of events) {
         try { document.removeEventListener(eventName, onReady); } catch {}
       }
+      try { window.removeEventListener("hashchange", onReady); } catch {}
       if (observer) {
         try { observer.disconnect(); } catch {}
       }
@@ -657,7 +663,7 @@ export function waitForManagedSectionReady(key, { timeoutMs = 20000 } = {}) {
     };
 
     const onReady = () => {
-      if (isSectionReadyForGate(key)) {
+      if (isSectionReadyForGate(key) || isInvalid()) {
         finish();
       }
     };
@@ -665,6 +671,7 @@ export function waitForManagedSectionReady(key, { timeoutMs = 20000 } = {}) {
     for (const eventName of events) {
       document.addEventListener(eventName, onReady);
     }
+    try { window.addEventListener("hashchange", onReady, { passive: true }); } catch {}
 
     const observerTarget = document.body || document.documentElement || null;
     if (observerTarget && typeof MutationObserver === "function") {
@@ -682,13 +689,21 @@ export function waitForManagedSectionReady(key, { timeoutMs = 20000 } = {}) {
       }
     }
 
-    timeoutId = setTimeout(finish, Math.max(0, timeoutMs | 0));
+    const timeoutValue = Number(timeoutMs);
+    if (allowTimeout !== false && Number.isFinite(timeoutValue) && timeoutValue > 0) {
+      timeoutId = setTimeout(finish, Math.max(0, timeoutValue | 0));
+    }
     onReady();
   });
 }
 
-export function waitForManagedSectionCompletion(key, { timeoutMs = 20000 } = {}) {
-  if (!key || hasSectionCompleted(key)) {
+export function waitForManagedSectionCompletion(key, {
+  timeoutMs = 20000,
+  allowTimeout = true,
+  isStillValid = null,
+} = {}) {
+  const isInvalid = () => (typeof isStillValid === "function" && !isStillValid());
+  if (!key || hasSectionCompleted(key) || isInvalid()) {
     return Promise.resolve();
   }
 
@@ -708,6 +723,7 @@ export function waitForManagedSectionCompletion(key, { timeoutMs = 20000 } = {})
       for (const eventName of events) {
         try { document.removeEventListener(eventName, onReady); } catch {}
       }
+      try { window.removeEventListener("hashchange", onReady); } catch {}
       if (observer) {
         try { observer.disconnect(); } catch {}
       }
@@ -718,7 +734,7 @@ export function waitForManagedSectionCompletion(key, { timeoutMs = 20000 } = {})
     };
 
     const onReady = () => {
-      if (hasSectionCompleted(key)) {
+      if (hasSectionCompleted(key) || isInvalid()) {
         finish();
       }
     };
@@ -726,6 +742,7 @@ export function waitForManagedSectionCompletion(key, { timeoutMs = 20000 } = {})
     for (const eventName of events) {
       document.addEventListener(eventName, onReady);
     }
+    try { window.addEventListener("hashchange", onReady, { passive: true }); } catch {}
 
     const observerTarget = document.body || document.documentElement || null;
     if (observerTarget && typeof MutationObserver === "function") {
@@ -743,7 +760,10 @@ export function waitForManagedSectionCompletion(key, { timeoutMs = 20000 } = {})
       }
     }
 
-    timeoutId = setTimeout(finish, Math.max(0, timeoutMs | 0));
+    const timeoutValue = Number(timeoutMs);
+    if (allowTimeout !== false && Number.isFinite(timeoutValue) && timeoutValue > 0) {
+      timeoutId = setTimeout(finish, Math.max(0, timeoutValue | 0));
+    }
     onReady();
   });
 }

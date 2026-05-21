@@ -57,13 +57,24 @@ export function createProfileChooserPanel(config, labels) {
 
   rememberRow.appendChild(rememberCb);
 
+  const privacyRow = document.createElement("div");
+  privacyRow.className = "fsetting-item profile-chooser-container";
+
+  const privacyCb = createCheckbox(
+    "profileChooserHideUsersFromRegularUsers",
+    labels?.profileChooserHideUsersFromRegularUsers || "Normal kullanıcılardan diğer profilleri gizle",
+    config.profileChooserHideUsersFromRegularUsers
+  );
+
+  privacyRow.appendChild(privacyCb);
+
   const desc = document.createElement("div");
   desc.className = "description-text";
   desc.textContent =
     labels?.profileChooserDesc ||
     "Bu ayar, Jellyfin arayüzünde Netflix benzeri kullanıcı seçme ekranını açar. Otomatik gösterim, hızlı giriş kuralı ve token hatırlama seçenekleri burada yönetilir.";
 
-  subWrap.append(autoRow, autoRuleWrap, rememberRow, desc);
+  subWrap.append(autoRow, autoRuleWrap, rememberRow, privacyRow, desc);
 
   section.append(enableRow, subWrap);
   panel.appendChild(section);
@@ -72,7 +83,7 @@ export function createProfileChooserPanel(config, labels) {
     "#enableProfileChooser",
     ".profile-chooser-sub",
     0.6,
-    [autoCb, autoRuleCb, rememberCb]
+    [autoCb, autoRuleCb, rememberCb, privacyCb]
   );
 
   bindCheckboxKontrol(

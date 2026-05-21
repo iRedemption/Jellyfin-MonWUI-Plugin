@@ -51,6 +51,11 @@ function usesDynamicHeaderOffset(variant = getActiveSliderVariant()) {
   return variant === 'slider' || variant === 'normalslider' || variant === 'peakslider';
 }
 
+function hasExplicitSlideTop(config = getConfig()) {
+  const value = Number(config?.slideTop);
+  return Number.isFinite(value) && value !== 0;
+}
+
 function findActiveSlidesContainer() {
   return document.querySelector(
     '#indexPage:not(.hide) #monwui-slides-container, #homePage:not(.hide) #monwui-slides-container, #monwui-slides-container'
@@ -169,10 +174,21 @@ function setSliderHeaderOffsetVar(container, offsetPx) {
   }
 }
 
+function clearSliderHeaderOffsetVar(container) {
+  document.documentElement?.style?.removeProperty(HEADER_OFFSET_VAR);
+  if (container) {
+    container.style.removeProperty(HEADER_OFFSET_VAR);
+  }
+}
+
 function clearSliderHeaderObserver() {
   sliderHeaderObservedEl = null;
   if (!sliderHeaderResizeObserver) return;
   try { sliderHeaderResizeObserver.disconnect(); } catch {}
+}
+
+function pauseSliderHeaderMutationObserver() {
+  try { sliderHeaderMutationObserver?.disconnect(); } catch {}
 }
 
 function reconnectSliderHeaderMutationObserver() {
@@ -302,27 +318,29 @@ function resolveTopStyleValue(prefix, rawTopValue, config = getConfig()) {
   const numericTopValue = Number(rawTopValue);
   if (!Number.isFinite(numericTopValue) || numericTopValue === 0) return '';
 
-  let topValue = `${numericTopValue}%`;
-  if (prefix === 'slide' && usesDynamicHeaderOffset(getActiveSliderVariant(config))) {
-    topValue = `calc(${topValue} + var(${HEADER_OFFSET_VAR}, 0px))`;
+  if (prefix === 'slide') {
+    return `${numericTopValue}vh`;
   }
-  return topValue;
+
+  return `${numericTopValue}%`;
 }
 
 export function syncSliderHeaderOffset(container = findActiveSlidesContainer()) {
-  bindSliderHeaderLifecycle();
-  const variant = getActiveSliderVariant();
+  const config = getConfig();
+  const variant = getActiveSliderVariant(config);
+  const explicitSlideTop = hasExplicitSlideTop(config);
 
-  if (!container || !usesDynamicHeaderOffset(variant)) {
-    document.documentElement?.style?.removeProperty(HEADER_OFFSET_VAR);
-    if (container) {
-      container.style.removeProperty(HEADER_OFFSET_VAR);
-    }
-    if (!usesDynamicHeaderOffset(variant)) {
+  if (!container || !usesDynamicHeaderOffset(variant) || explicitSlideTop) {
+    clearSliderHeaderOffsetVar(container);
+    if (!usesDynamicHeaderOffset(variant) || explicitSlideTop) {
       clearSliderHeaderObserver();
+      pauseSliderHeaderMutationObserver();
     }
     return;
   }
+
+  bindSliderHeaderLifecycle();
+  reconnectSliderHeaderMutationObserver();
 
   const header = findVisibleSkinHeader();
   if (!header) {
@@ -394,7 +412,7 @@ export function updateSlidePosition() {
   }
 
   const containerTypes = [
-    'logo', 'meta', 'status', 'rating', 'plot',
+    'logo', 'meta', 'format', 'status', 'rating', 'plot',
     'title', 'director', 'info', 'button',
     'existingDot', 'provider', 'providericons'
   ];

@@ -48,7 +48,6 @@ const CUSTOM_SPLASH_TITLE_VAR = "--jms-custom-splash-title";
 const CUSTOM_SPLASH_CAPTION_VAR = "--jms-custom-splash-caption";
 const CUSTOM_SPLASH_PROGRESS_KEY = "__JMS_CUSTOM_SPLASH_PROGRESS__";
 const CUSTOM_SPLASH_PING_PATHS = ["/JMSFusion/ping", "/Plugins/JMSFusion/ping"];
-const CUSTOM_SPLASH_PING_CACHE_MS = 15_000;
 const CUSTOM_SPLASH_TIMEOUT_MS = 12_000;
 const CUSTOM_SPLASH_CLEANUP_MS = 420;
 const CUSTOM_SPLASH_EXIT_SYNC_MS = 120;
@@ -79,15 +78,25 @@ const HOME_ITEM_DETAILS_STATIC_FIELDS = [
   "IndexNumber",
   "SeriesId",
   "SeriesName",
-  "CollectionIds"
+  "CollectionIds",
+  "Studios",
+  "AlbumId",
+  "Album",
+  "AlbumArtist",
+  "AlbumArtistId",
+  "Artists",
+  "ArtistId",
+  "ArtistIds",
+  "ArtistItems",
+  "PrimaryImageTag"
 ];
 const HOME_ITEM_DETAILS_USERDATA_FIELDS = ["UserData"];
-const HOME_ITEM_DETAILS_REVALIDATE_MS = 6 * 60 * 60 * 1000;
-const HOME_ITEM_DETAILS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const HOME_ITEM_DETAILS_REVALIDATE_MS = 24 * 60 * 60 * 1000;
+const HOME_ITEM_DETAILS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const HOME_ITEM_USERDATA_CACHE_TTL_MS = 5 * 60 * 1000;
 const HOME_RESUME_CACHE_TTL_MS = 5 * 60 * 1000;
 const HOME_LIBRARY_WATCH_INTERVAL_MS = 5 * 60 * 1000;
-const HOME_ITEMS_POOL_CACHE_TTL_MS = 15 * 60 * 1000;
+const HOME_ITEMS_POOL_CACHE_TTL_MS = 30 * 60 * 1000;
 const FOCUSED_USERDATA_SYNC_MIN_GAP_MS = 45_000;
 let materialIconsRepairPromise = null;
 let __notificationsModulePromise = null;
@@ -102,15 +111,11 @@ let __customSplashObserver = null;
 let __customSplashCleanupTimer = 0;
 let __customSplashHideTimer = 0;
 let __customSplashHardTimer = 0;
-let __customSplashAvailabilityPromise = null;
-let __customSplashAvailabilityCheckedAt = 0;
-let __customSplashAvailabilityValue = null;
 let __customSplashRouteGuardReady = false;
 let __authContextRecoveryTimer = 0;
 let __lastRecoveredAuthContextKey = "";
 let __sliderUserDataRefreshTimer = 0;
 const __customSplashProgressState = {
-  authReady: false,
   dataPoolReady: false,
   selectionReady: false,
   firstSlideReady: false,
@@ -145,6 +150,42 @@ function bootNotificationsOnce() {
       window.__jmsNotificationsBooted = false;
       console.warn("initNotifications failed:", error);
     });
+}
+
+function bootSerrIntegrationOnce() {
+  const liveCfg = getMainConfig();
+  if (liveCfg.enableSerrArrIntegrationModule === false) {
+    cleanupSerrIntegration();
+    return;
+  }
+
+  if (window.__monwuiSerrIntegrationBooted) return;
+  window.__monwuiSerrIntegrationBooted = true;
+
+  const bootModule = (path, cleanupKey, initName) => {
+    if (window[cleanupKey]) return;
+    import(path)
+      .then((mod) => {
+        if (!window[cleanupKey]) {
+          window[cleanupKey] = mod?.[initName]?.() || null;
+        }
+      })
+      .catch((error) => {
+        window.__monwuiSerrIntegrationBooted = false;
+        console.warn(`${initName} failed:`, error);
+      });
+  };
+
+  bootModule("./modules/seerr/searchBridge.js", "cleanupSerrSearchBridge", "initSerrSearchBridge");
+  bootModule("./modules/seerr/itemPageBridge.js", "cleanupSerrItemPageBridge", "initSerrItemPageBridge");
+}
+
+function cleanupSerrIntegration() {
+  try { window.cleanupSerrSearchBridge?.(); } catch {}
+  try { window.cleanupSerrItemPageBridge?.(); } catch {}
+  window.cleanupSerrSearchBridge = null;
+  window.cleanupSerrItemPageBridge = null;
+  window.__monwuiSerrIntegrationBooted = false;
 }
 
 function getDomObserveRoot() {
@@ -888,7 +929,6 @@ function completeCustomSplashProgress(options = {}) {
 }
 
 function resetCustomSplashProgressState() {
-  __customSplashProgressState.authReady = false;
   __customSplashProgressState.dataPoolReady = false;
   __customSplashProgressState.selectionReady = false;
   __customSplashProgressState.firstSlideReady = false;
@@ -936,12 +976,6 @@ function syncCustomSplashProgress(patch = {}) {
     progress = Math.max(progress, 0.12);
     stage = splashLabel("customSplashStageStructure", "OMURGA");
     detail = splashLabel("customSplashDetailStructure", "Arayüz omurgası senkrona girdi");
-  }
-
-  if (state.authReady) {
-    progress = Math.max(progress, 0.24);
-    stage = splashLabel("customSplashStageAuth", "YETKI");
-    detail = splashLabel("customSplashDetailAuth", "Oturum anahtarı doğrulandı");
   }
 
   if (state.dataPoolReady) {
@@ -1263,13 +1297,12 @@ function isCustomSplashHomeContext() {
   }
 }
 
-function buildCustomSplashPingUrl(path, { force = false } = {}) {
+function buildCustomSplashPingUrl(path) {
   const base = normalizeWithServer(path);
-  const cacheBucket = force ? String(Date.now()) : String(Math.floor(Date.now() / CUSTOM_SPLASH_PING_CACHE_MS));
 
   try {
     const url = new URL(base, window.location.origin);
-    url.searchParams.set("_ts", cacheBucket);
+    url.searchParams.set("_jms_splash_ping", String(Date.now()));
 
     const version = String(window.__JMS_ASSET_VERSION__ || "").trim();
     if (version) {
@@ -1279,55 +1312,47 @@ function buildCustomSplashPingUrl(path, { force = false } = {}) {
     return url.toString();
   } catch {
     const sep = base.includes("?") ? "&" : "?";
-    return `${base}${sep}_ts=${encodeURIComponent(cacheBucket)}`;
+    return `${base}${sep}_jms_splash_ping=${encodeURIComponent(String(Date.now()))}`;
   }
 }
 
-async function probeCustomSplashPluginAvailability({ force = false } = {}) {
-  const now = Date.now();
-  if (!force && __customSplashAvailabilityPromise) {
-    return __customSplashAvailabilityPromise;
-  }
-  if (
-    !force &&
-    __customSplashAvailabilityValue !== null &&
-    (now - __customSplashAvailabilityCheckedAt) < CUSTOM_SPLASH_PING_CACHE_MS
-  ) {
-    return __customSplashAvailabilityValue;
-  }
-
-  const task = (async () => {
-    for (const path of CUSTOM_SPLASH_PING_PATHS) {
-      try {
-        const res = await fetch(buildCustomSplashPingUrl(path, { force }), {
-          method: "GET",
-          cache: "no-store",
-          credentials: "same-origin",
-          headers: {
-            "Cache-Control": "no-store, no-cache, max-age=0",
-            Pragma: "no-cache"
-          }
-        });
-
-        if (res.ok || res.status === 401 || res.status === 403) {
-          __customSplashAvailabilityValue = true;
-          __customSplashAvailabilityCheckedAt = Date.now();
-          return true;
+async function probeCustomSplashPluginAvailability() {
+  for (const path of CUSTOM_SPLASH_PING_PATHS) {
+    try {
+      const res = await fetch(buildCustomSplashPingUrl(path), {
+        method: "GET",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: {
+          "Cache-Control": "no-store, no-cache, max-age=0",
+          Pragma: "no-cache"
         }
-      } catch {}
-    }
+      });
 
-    __customSplashAvailabilityValue = false;
-    __customSplashAvailabilityCheckedAt = Date.now();
-    return false;
-  })();
-
-  __customSplashAvailabilityPromise = task;
-  try {
-    return await task;
-  } finally {
-    __customSplashAvailabilityPromise = null;
+      if (res.ok || res.status === 401 || res.status === 403) {
+        return true;
+      }
+    } catch {}
   }
+
+  return false;
+}
+
+function verifyCustomSplashPluginInstalled() {
+  const root = getCustomSplashRoot();
+  if (!root?.hasAttribute(CUSTOM_SPLASH_ACTIVE_ATTR) || root?.hasAttribute(CUSTOM_SPLASH_HIDDEN_ATTR)) {
+    return;
+  }
+
+  void probeCustomSplashPluginAvailability()
+    .then((available) => {
+      if (!available) {
+        dismissCustomSplashImmediately("plugin-unavailable");
+      }
+    })
+    .catch(() => {
+      dismissCustomSplashImmediately("plugin-unavailable");
+    });
 }
 
 function getCustomSplashCandidateSlide(targetSlide = null) {
@@ -1593,13 +1618,7 @@ function initCustomSplash() {
         return false;
       }
 
-      void probeCustomSplashPluginAvailability({ force: true }).then((available) => {
-        if (!available) {
-          dismissCustomSplashImmediately("plugin-unavailable");
-        }
-      }).catch(() => {
-        dismissCustomSplashImmediately("plugin-unavailable");
-      });
+      verifyCustomSplashPluginInstalled();
 
       if (!root?.hasAttribute(CUSTOM_SPLASH_ACTIVE_ATTR)) return true;
       applyCustomSplashCopy();
@@ -1626,14 +1645,7 @@ function initCustomSplash() {
     return api;
   }
 
-  void probeCustomSplashPluginAvailability().then((available) => {
-    if (!available) {
-      dismissCustomSplashImmediately("plugin-unavailable");
-    }
-  }).catch(() => {
-    dismissCustomSplashImmediately("plugin-unavailable");
-  });
-
+  verifyCustomSplashPluginInstalled();
   resetCustomSplashProgressState();
   applyCustomSplashCopy();
   syncCustomSplashProgress();
@@ -3546,7 +3558,14 @@ async function refreshOptionalModules({ forcePause = false } = {}) {
   const tasks = [
     refreshSubtitleCustomizer(),
     forcePause ? restartPauseOverlay() : startPauseOverlayOnce(),
-    refreshPauseOsdHeaderRatings({ force: forcePause })
+    refreshPauseOsdHeaderRatings({ force: forcePause }),
+    Promise.resolve().then(async () => {
+      bootSerrIntegrationOnce();
+      if (window.__jmsNotificationsBooted) {
+        const mod = await getNotificationsModule();
+        mod?.syncSerrNotificationsIntegration?.();
+      }
+    })
   ];
 
   const results = await Promise.allSettled(tasks);
@@ -3611,6 +3630,7 @@ function ensureLayerPropertySanitizer() {
     "#monwui-slides-container .monwui-language-container",
     "#monwui-slides-container .monwui-status-container",
     "#monwui-slides-container .monwui-meta-container",
+    "#monwui-slides-container .monwui-format-container",
     "#monwui-slides-container .monwui-slider-wrapper",
     "#monwui-slides-container .monwui-button-container",
     "#monwui-slides-container .monwui-button-container *",
@@ -3776,6 +3796,7 @@ function setupGlobalModalInit() {
 }
 const cleanupModalObserver = setupGlobalModalInit();
 window.cleanupModalObserver = cleanupModalObserver;
+bootSerrIntegrationOnce();
 
 function runNonCriticalUiBootOnce() {
   if (window.__jmsNonCriticalBooted) return;
@@ -3811,6 +3832,8 @@ function runNonCriticalUiBootOnce() {
         window.__qualityBadgesBooted = true;
         try { window.cleanupQualityBadges = initializeQualityBadges(); } catch {}
       }
+
+      try { bootSerrIntegrationOnce(); } catch {}
 
     });
   }, 7000);
@@ -4660,14 +4683,37 @@ export async function slidesInit() {
     isSliderBootTokenCurrent(bootToken, { requireHomeVisible, requireContainer });
   window.__slidesInitRunning = true;
   setHomeSliderRuntimeItems([]);
-  try {
-    await waitAuthWarmupFallback(5000);
-  } catch {}
-  if (!isBootActive({ requireHomeVisible: false })) return;
-  syncCustomSplashProgress({ authReady: true });
+  if (!isBootActive({ requireHomeVisible: false })) {
+    window.__slidesInitRunning = false;
+    return;
+  }
   try {
     forceSkinHeaderPointerEvents();
     forceHomeSectionsTop();
+
+    let userId = null, accessToken = null;
+    let fetchItemDetailsCached = window.__jmsFetchItemDetailsCached || null;
+    const config = getMainConfig();
+
+    try {
+      const s = getSessionInfo();
+      userId = s.userId;
+      accessToken = s.accessToken;
+    } catch (e) {
+      console.error("Oturum bilgisi okunamadı:", e);
+      return;
+    }
+    if (!userId || !accessToken) {
+      console.warn("[JMS] Oturum bilgisi henüz hazır değil; ana sayfa bekletilmeden tekrar denenecek.");
+      window.setTimeout(() => {
+        try {
+          if (!window.__slidesInitRunning && isHomeVisible()) {
+            slidesInit();
+          }
+        } catch {}
+      }, 500);
+      return;
+    }
 
     const activeResetToken = Number(window.__jmsSliderResetToken) || 0;
     if (window.sliderResetInProgress && !isSliderBootTokenCurrent(activeResetToken, { requireHomeVisible: false })) {
@@ -4679,10 +4725,6 @@ export async function slidesInit() {
     window.sliderResetInProgress = true;
     window.__jmsSliderResetToken = bootToken;
     fullSliderReset({ invalidateBoot: false, reason: "slidesInit:boot-reset" });
-
-    let userId = null, accessToken = null;
-    let fetchItemDetailsCached = window.__jmsFetchItemDetailsCached || null;
-    const config = getMainConfig();
 
     function isQuotaErr(e){ return e && (e.name === 'QuotaExceededError' || e.code === 22); }
 
@@ -4741,17 +4783,6 @@ export async function slidesInit() {
       safeLocalRemove(key);
     }
 
-    try {
-      if (typeof isAuthReadyStrict === "function" && !isAuthReadyStrict()) {
-        await waitAuthWarmupFallback(1000);
-    }
-      const s = getSessionInfo();
-      userId = s.userId;
-      accessToken = s.accessToken;
-    } catch (e) {
-      console.error("Oturum bilgisi okunamadı:", e);
-      return;
-    }
     if (!isBootActive()) return;
 
     const bulkBatchSize = Number(config?.detailsBulkBatchSize) || 60;
@@ -5000,11 +5031,9 @@ export async function slidesInit() {
             seasonDetailConcurrency,
             async (item) => {
               try {
-                const seasonRes = await safeFetch(`/Users/${userId}/Items/${item.Id}`, { headers: authHeaders });
-                const seasonData = await seasonRes.json();
+                const seasonData = await fetchItemDetailsCached(item.Id) || item;
                 if (seasonData.SeriesId) {
-                  const seriesRes = await safeFetch(`/Users/${userId}/Items/${seasonData.SeriesId}`, { headers: authHeaders });
-                  seasonData.SeriesData = await seriesRes.json();
+                  seasonData.SeriesData = await fetchItemDetailsCached(seasonData.SeriesId);
                 }
                 return seasonData;
               } catch (error) {
@@ -5177,7 +5206,7 @@ export async function slidesInit() {
             .map((it) => [it.Id, it])
         );
         const detailed = await fetchItemDetailsCached.many(selectedItems.map(i => i.Id), {
-          persistFetched: false
+          persistFetched: true
         });
         const userDataById = await fetchHomeItemUserDataMap(selectedItems.map((item) => item?.Id));
         items = detailed

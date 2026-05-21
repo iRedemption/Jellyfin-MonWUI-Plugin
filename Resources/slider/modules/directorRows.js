@@ -1,5 +1,3 @@
-//directorRows.js
-
 import { getSessionInfo, makeApiRequest, getCachedUserTopGenres } from "../../Plugins/JMSFusion/runtime/api.js";
 import { getConfig, getHomeSectionsRuntimeConfig } from "./config.js";
 import { getLanguageLabels } from "../language/index.js";
@@ -30,6 +28,7 @@ import {
 import {
   enqueueManagedSectionRender,
   registerManagedHomeRowAnchor,
+  waitForManagedSectionDependencyCompletion,
   waitForManagedHomeRowRelease
 } from "./homeSectionChain.js";
 import {
@@ -83,10 +82,10 @@ const DIRECTOR_MOBILE_CARD_DELAY_MS = 90;
 const HOME_DEBUG_STORAGE_KEY = "jms:debug:home-sections";
 const HOME_TRACE_STORAGE_KEY = "jms:trace:home-sections";
 const DIRECTOR_ROWS_RELEASE_ROOT_MARGIN = IS_MOBILE
-  ? (IS_MOBILE_WEBVIEW ? "0px 0px 78% 0px" : "0px 0px 60% 0px")
+  ? (IS_MOBILE_WEBVIEW ? "0px 0px 100% 0px" : "0px 0px 90% 0px")
   : "0px 0px 22% 0px";
 const DIRECTOR_ROWS_ARROW_OBSERVER_ROOT_MARGIN = IS_MOBILE
-  ? (IS_MOBILE_WEBVIEW ? "0px 0px 84% 0px" : "0px 0px 66% 0px")
+  ? (IS_MOBILE_WEBVIEW ? "0px 0px 100% 0px" : "0px 0px 92% 0px")
   : "0px 0px 26% 0px";
 const DIRECTOR_ROWS_ARROW_OBSERVER_THRESHOLD = IS_MOBILE ? 0.01 : 0.2;
 
@@ -2382,6 +2381,27 @@ function scheduleDirectorInitWhenReady(mountState, { force = false } = {}) {
         dirRowsLog("deferred:skip:state-started", { seq });
         return true;
       }
+      try {
+        await waitForManagedSectionDependencyCompletion("directorRows", {
+          requireCompletion: true,
+          allowTimeout: false,
+          timeoutMs: 0,
+          isStillValid: () => (
+            seq === __directorDeferredSeq &&
+            isDirectorRowsMountStateValid(resolveDirectorRowsMountState(
+              initialMountState?.container,
+              initialMountState?.page
+            ))
+          ),
+        });
+      } catch {}
+      if (seq !== __directorDeferredSeq) return false;
+      if (!isDirectorRowsMountStateValid(resolveDirectorRowsMountState(
+        initialMountState?.container,
+        initialMountState?.page
+      ))) {
+        return false;
+      }
       dirRowsLog("render:start", {
         force,
         seq,
@@ -2418,6 +2438,7 @@ function scheduleDirectorInitWhenReady(mountState, { force = false } = {}) {
   }, {
     timeoutMs: 25000,
     force,
+    rootMargin: DIRECTOR_ROWS_RELEASE_ROOT_MARGIN,
     getAnchor: () => getDirectorRowsAnchor(initialMountState?.container),
     isStillValid: () => (
       seq === __directorDeferredSeq &&
@@ -2839,25 +2860,11 @@ function renderDirectorSection(dir, { deferContent = false, sectionIndex = 0 } =
   heroHost.style.display = SHOW_DIRECTOR_ROWS_HERO_CARDS ? '' : 'none';
   heroHost.style.visibility = 'hidden';
 
-  const btnL = document.createElement('button');
-  btnL.className = 'hub-scroll-btn hub-scroll-left';
-  btnL.setAttribute('aria-label', (config.languageLabels?.scrollLeft) || "Sola kaydır");
-  btnL.setAttribute('aria-disabled', 'true');
-  btnL.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>`;
-
   const row = document.createElement('div');
   row.className = 'itemsContainer personal-recs-row';
   row.setAttribute('role', 'list');
 
-  const btnR = document.createElement('button');
-  btnR.className = 'hub-scroll-btn hub-scroll-right';
-  btnR.setAttribute('aria-label', (config.languageLabels?.scrollRight) || "Sağa kaydır");
-  btnR.setAttribute('aria-disabled', 'true');
-  btnR.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>`;
-
-  scrollWrap.appendChild(btnL);
   scrollWrap.appendChild(row);
-  scrollWrap.appendChild(btnR);
 
   section.appendChild(title);
   section.appendChild(heroHost);

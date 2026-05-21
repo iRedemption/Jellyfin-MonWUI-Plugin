@@ -1,4 +1,4 @@
-import { getSessionInfo } from "../../Plugins/JMSFusion/runtime/api.js";
+import { fetchItemDetails, getSessionInfo } from "../../Plugins/JMSFusion/runtime/api.js";
 import { createScopedJsonDb, prepareLegacyIndexedDbForDeletion } from "./scopedJsonCache.js";
 
 const DB_NAME = "jms-slider-cache";
@@ -14,10 +14,10 @@ const MAX_META_RECORDS = 1500;
 const META_TTL_MS = 45 * 24 * 60 * 60 * 1000;
 
 const DEFAULTS = {
-  itemTtlMs: 24 * 60 * 60 * 1000,
-  queryTtlMs: 2 * 60 * 1000,
+  itemTtlMs: 7 * 24 * 60 * 60 * 1000,
+  queryTtlMs: 5 * 60 * 1000,
   resumeTtlMs: 30 * 1000,
-  listFileTtlMs: 60 * 1000,
+  listFileTtlMs: 15 * 60 * 1000,
   allowStaleOnError: true,
   maxConcurrent: 6,
 };
@@ -217,23 +217,64 @@ function readWrappedJsonItems(row) {
   return [];
 }
 
+function hasMeaningfulDetailValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (isRecord(value)) return Object.keys(value).length > 0;
+  return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function poolItemCoversDetail(poolItem, detailItem) {
+  if (!isRecord(poolItem) || !isRecord(detailItem)) return false;
+
+  const detailOnlyFields = [
+    "People",
+    "MediaStreams",
+    "ProviderIds",
+    "RemoteTrailers",
+    "TrailerUrls",
+    "Taglines",
+    "Studios",
+    "Genres",
+    "ProductionLocations",
+    "Overview",
+    "OriginalTitle",
+    "Album",
+    "AlbumArtist",
+    "AlbumArtistId",
+    "Artists",
+    "ArtistId",
+    "ArtistIds",
+    "ArtistItems"
+  ];
+
+  for (const field of detailOnlyFields) {
+    if (hasMeaningfulDetailValue(detailItem[field]) && !hasMeaningfulDetailValue(poolItem[field])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function pruneItemDetailsCoveredByItemsPool(store) {
   const itemDetails = store[STORE_ITEM_DETAILS] || {};
   const queryCache = store[STORE_QUERY_CACHE] || {};
-  const coveredIds = new Set();
+  const coveredItems = new Map();
 
   for (const row of Object.values(queryCache)) {
     if (String(row?.meta?.kind || "") !== "itemsPool") continue;
     for (const item of readWrappedJsonItems(row)) {
       const id = String(item?.Id || item?.id || "").trim();
-      if (id) coveredIds.add(id);
+      if (id && !coveredItems.has(id)) coveredItems.set(id, item);
     }
   }
 
-  if (!coveredIds.size) return;
+  if (!coveredItems.size) return;
 
-  for (const id of coveredIds) {
-    if (!itemDetails[id]) continue;
+  for (const [id, poolItem] of coveredItems.entries()) {
+    const row = itemDetails[id] || null;
+    if (!row) continue;
+    if (!poolItemCoversDetail(poolItem, row.data)) continue;
     delete itemDetails[id];
   }
 }
@@ -286,7 +327,7 @@ async function openDb() {
       saveDelayMs: 700,
       retryDelayMs: 2000,
       legacyDbNames: [DB_NAME],
-      stableIgnoreFields: ["fetchedAt", "expiresAt", "updatedAt"]
+      stableIgnoreFields: ["fetchedAt", "updatedAt"]
     }));
   }
 
@@ -591,6 +632,47 @@ export async function cachePutItem(id, data, { ttlMs = DEFAULTS.itemTtlMs } = {}
       return false;
     }
   });
+}
+
+function shouldRevalidateCacheEntry(entry, revalidateAfterMs = 0) {
+  const maxAgeMs = Math.max(0, Number(revalidateAfterMs) || 0);
+  if (!entry || !(maxAgeMs > 0)) return false;
+
+  const fetchedAt = Number(entry.fetchedAt || 0);
+  if (!(fetchedAt > 0)) return true;
+  return (now() - fetchedAt) > maxAgeMs;
+}
+
+export async function fetchItemDetailsFromSliderCache(itemId, {
+  ttlMs = DEFAULTS.itemTtlMs,
+  revalidateAfterMs = 24 * 60 * 60 * 1000,
+  allowStaleOnError = DEFAULTS.allowStaleOnError,
+  fetchOne = fetchItemDetails,
+} = {}) {
+  const id = String(itemId || "").trim();
+  if (!id) return null;
+
+  const freshEntry = await cacheGetItemEntry(id, { allowStale: false }).catch(() => null);
+  if (freshEntry && !shouldRevalidateCacheEntry(freshEntry, revalidateAfterMs)) {
+    return freshEntry.data || null;
+  }
+
+  const staleEntry = allowStaleOnError
+    ? (freshEntry || await cacheGetItemEntry(id, { allowStale: true }).catch(() => null))
+    : null;
+  const stale = staleEntry?.data || null;
+
+  try {
+    const data = typeof fetchOne === "function" ? await fetchOne(id) : null;
+    if (data) {
+      await cachePutItem(id, data, { ttlMs });
+      return data;
+    }
+    return stale;
+  } catch (e) {
+    if (allowStaleOnError && stale) return stale;
+    throw e;
+  }
 }
 
 function cachePutItemMemory(id, data, { ttlMs = DEFAULTS.itemTtlMs } = {}) {

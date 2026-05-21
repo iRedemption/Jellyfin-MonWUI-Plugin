@@ -5,6 +5,14 @@ import { withServer } from "./jfUrl.js";
 import { ensureStudioHubLogoFromTmdb, ensureStudioHubManualEntry, JMS_STUDIO_HUB_MANUAL_ENTRY_ADDED_EVENT } from "./studioHubsShared.js";
 import { showNotification } from "./player/ui/notification.js";
 import { closeDetailsModalIfLoaded } from "./detailsModalLoader.js";
+import {
+  ensureSerrMissingVisualStyles,
+  getSerrMissingSyntheticItems,
+  getSerrMissingSyntheticPosterUrl,
+  isSerrMissingSyntheticItem,
+  isSerrMissingSyntheticItemRequested,
+  requestSerrMissingSyntheticItem
+} from "./seerr/itemPageBridge.js";
 
 const WATCHLIST_ENDPOINT = "/Plugins/jmsFusion/watchlist";
 export const WATCHLIST_MODAL_ID = "monwui-watchlist-modal-root";
@@ -26,6 +34,7 @@ let dashboardCache = null;
 let dashboardPromise = null;
 let generalStatsCache = null;
 let generalStatsPromise = null;
+const serrMissingPreviewItems = new Map();
 let usersCache = null;
 let usersPromise = null;
 let tabsSliderObserver = null;
@@ -94,11 +103,13 @@ const GENERAL_STATS_ITEM_FIELDS = [
   "Type","Name","SeriesName","ProductionYear","DateCreated","UserData","AlbumArtist","Artists","RunTimeTicks"
 ];
 const WATCHLIST_VIEW_FIELDS = [
-  "Type","Name","SeriesId","SeriesName","Album","AlbumId","AlbumArtist","Artists","Overview","Genres","RunTimeTicks",
+  "Type","Name","OriginalTitle","ProviderIds","SeriesId","SeriesName","ParentId","Album","AlbumId","AlbumArtist","Artists","Overview","Genres","RunTimeTicks",
   "CumulativeRunTimeTicks",
-  "OfficialRating","ProductionYear","CommunityRating","CriticRating","ImageTags","PrimaryImageTag",
-  "AlbumPrimaryImageTag","BackdropImageTags","ParentBackdropImageTags","ParentBackdropItemId",
-  "SeriesBackdropImageTag","SeasonId","Series","UserData","MediaType","ChildCount"
+  "OfficialRating","ProductionYear","PremiereDate","LocationType","CommunityRating","CriticRating","ImageTags","PrimaryImageTag",
+  "AlbumPrimaryImageTag","SeriesPrimaryImageTag","SeriesThumbImageTag","ParentPrimaryImageItemId",
+  "ParentPrimaryImageTag","ParentThumbItemId","ParentThumbImageTag","BackdropImageTags",
+  "ParentBackdropImageTags","ParentBackdropItemId","SeriesBackdropImageTag","SeasonId","Series",
+  "UserData","MediaType","ChildCount"
 ];
 const WATCHLIST_PROGRESSIVE_RENDER_THRESHOLD = 48;
 const WATCHLIST_PROGRESSIVE_INITIAL_BATCH = 24;
@@ -118,6 +129,10 @@ function cfg() {
 
 function shouldShowWatchlistTabsSliderButton() {
   return cfg()?.watchlistTabsSliderEnabled !== false;
+}
+
+export function isWatchlistSharingEnabled() {
+  return cfg()?.watchlistSharingEnabled !== false;
 }
 
 function shouldAutoRemovePlayedFromWatchlist() {
@@ -454,6 +469,17 @@ function wasPlayedAfterWatchlistTimestamp(itemLike, watchlistTs) {
   const threshold = toTimestampMs(watchlistTs);
   if (threshold <= 0) return false;
   return getLastPlayedTimestamp(itemLike) > threshold;
+}
+
+function getCompletedContainerPlayedAt(items = []) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length || !list.every((item) => isMarkedPlayed(item))) return 0;
+  return Math.max(...list.map((item) => getLastPlayedTimestamp(item)));
+}
+
+function wasContainerCompletedAfterWatchlistTimestamp(items = [], watchlistTs) {
+  const threshold = toTimestampMs(watchlistTs);
+  return threshold > 0 && getCompletedContainerPlayedAt(items) > threshold;
 }
 
 function escapeHtml(value) {
@@ -1295,18 +1321,18 @@ export async function hydrateWatchlistState(payload, { force = false } = {}) {
 
 function snapshotFromItem(item, itemId) {
   return {
-    ItemId: text(item?.Id || itemId),
-    ItemType: text(item?.Type),
-    Name: text(item?.Name || item?.Album),
-    Overview: text(item?.Overview),
-    ProductionYear: Number.isFinite(Number(item?.ProductionYear)) ? Number(item.ProductionYear) : null,
-    RunTimeTicks: Number.isFinite(Number(item?.RunTimeTicks)) ? Number(item.RunTimeTicks) : null,
-    CommunityRating: Number.isFinite(Number(item?.CommunityRating)) ? Number(item.CommunityRating) : null,
-    OfficialRating: text(item?.OfficialRating),
-    Genres: Array.isArray(item?.Genres) ? item.Genres.filter(Boolean) : [],
-    AlbumArtist: text(item?.AlbumArtist),
-    Artists: Array.isArray(item?.Artists) ? item.Artists.filter(Boolean) : [],
-    ParentName: text(item?.SeriesName || item?.Album || item?.ParentName),
+    ItemId: text(item?.Id || item?.ItemId || item?.itemId || itemId),
+    ItemType: text(item?.Type || item?.ItemType || item?.itemType),
+    Name: text(item?.Name || item?.name || item?.Album || item?.album),
+    Overview: text(item?.Overview || item?.overview),
+    ProductionYear: Number.isFinite(Number(item?.ProductionYear ?? item?.productionYear)) ? Number(item?.ProductionYear ?? item?.productionYear) : null,
+    RunTimeTicks: Number.isFinite(Number(item?.RunTimeTicks ?? item?.runtimeTicks)) ? Number(item?.RunTimeTicks ?? item?.runtimeTicks) : null,
+    CommunityRating: Number.isFinite(Number(item?.CommunityRating ?? item?.communityRating)) ? Number(item?.CommunityRating ?? item?.communityRating) : null,
+    OfficialRating: text(item?.OfficialRating || item?.officialRating),
+    Genres: Array.isArray(item?.Genres) ? item.Genres.filter(Boolean) : (Array.isArray(item?.genres) ? item.genres.filter(Boolean) : []),
+    AlbumArtist: text(item?.AlbumArtist || item?.albumArtist),
+    Artists: Array.isArray(item?.Artists) ? item.Artists.filter(Boolean) : (Array.isArray(item?.artists) ? item.artists.filter(Boolean) : []),
+    ParentName: text(item?.SeriesName || item?.Album || item?.ParentName || item?.parentName),
   };
 }
 
@@ -1549,7 +1575,7 @@ export async function removeFromWatchlist(itemId, options = {}) {
   return result;
 }
 
-export async function shareWatchlistItem(itemId, targets = [], note = "") {
+export async function shareWatchlistItem(itemId, targets = [], note = "", options = {}) {
   const id = text(itemId);
   const normalizedTargets = (targets || [])
     .map((target) => ({
@@ -1558,8 +1584,13 @@ export async function shareWatchlistItem(itemId, targets = [], note = "") {
     }))
     .filter((target) => target.UserId);
 
+  if (!isWatchlistSharingEnabled()) throw new Error(L("watchlistSharingDisabled", "İzleme listesi paylaşımı kapalı"));
   if (!id) throw new Error("itemId gerekli");
   if (!normalizedTargets.length) throw new Error(L("watchlistSelectUsers", "En az bir kullanıcı seç"));
+
+  const snapshot = options?.snapshot && typeof options.snapshot === "object"
+    ? options.snapshot
+    : (options?.item ? snapshotFromItem(options.item, id) : null);
 
   const result = await requestWatchlist("/shares", {
     method: "POST",
@@ -1567,6 +1598,7 @@ export async function shareWatchlistItem(itemId, targets = [], note = "") {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
+      ...(snapshot || {}),
       ItemId: id,
       Targets: normalizedTargets,
       Note: text(note)
@@ -1596,16 +1628,16 @@ function collectAutoRemovalTasksByItemId(itemId, dashboard = dashboardCache) {
   if (!id || !dashboard) return [];
 
   const tasks = [];
-  const hasOwn = (dashboard.myItems || []).some((entry) => text(entry?.ItemId || entry?.itemId) === id);
-  if (hasOwn) {
-    tasks.push({ kind: "own", itemId: id });
+  const own = (dashboard.myItems || []).find((entry) => text(entry?.ItemId || entry?.itemId) === id);
+  if (own) {
+    tasks.push({ kind: "own", itemId: id, addedAtUtc: Number(own?.AddedAtUtc || own?.addedAtUtc || 0) });
   }
 
   for (const shared of dashboard.sharedWithMe || []) {
     const shareId = text(shared?.Id || shared?.id);
     const sharedItemId = text(shared?.ItemId || shared?.itemId || shared?.Entry?.ItemId || shared?.entry?.itemId);
     if (!shareId || sharedItemId !== id) continue;
-    tasks.push({ kind: "shared", itemId: id, shareId });
+    tasks.push({ kind: "shared", itemId: id, shareId, sharedAtUtc: Number(shared?.SharedAtUtc || shared?.sharedAtUtc || 0) });
   }
 
   return tasks;
@@ -1700,7 +1732,7 @@ async function isSeriesSeasonWatchlistItemComplete(containerItem, { signal } = {
   return items.length > 0 && items.every((item) => isMarkedPlayed(item));
 }
 
-async function getCompletedSeriesSeasonWatchlistItemIds(dashboard, found) {
+async function getCompletedSeriesSeasonWatchlistItemPlayedAt(dashboard, found) {
   const candidates = new Map();
 
   const registerCandidate = (entryLike, liveItem = null) => {
@@ -1733,18 +1765,19 @@ async function getCompletedSeriesSeasonWatchlistItemIds(dashboard, found) {
     registerCandidate(entry, found?.get?.(itemId) || null);
   }
 
-  if (!candidates.size) return new Set();
+  if (!candidates.size) return new Map();
 
   const checks = await mapWithConcurrency(
     [...candidates.values()],
     3,
     async (candidate) => {
-      const complete = await isSeriesSeasonWatchlistItemComplete(candidate).catch(() => false);
-      return complete ? candidate.Id : "";
+      const items = await fetchSeriesSeasonAutoRemoveItems(candidate).catch(() => []);
+      const completedAt = getCompletedContainerPlayedAt(items);
+      return completedAt > 0 ? [candidate.Id, completedAt] : null;
     }
   );
 
-  return new Set(checks.filter(Boolean));
+  return new Map(checks.filter(Boolean));
 }
 
 async function collectParentContainerAutoRemovalTasks(itemId, dashboard = dashboardCache) {
@@ -1773,8 +1806,9 @@ async function collectParentContainerAutoRemovalTasks(itemId, dashboard = dashbo
       const tasks = collectAutoRemovalTasksByItemId(candidate.Id, dashboard);
       if (!tasks.length) return [];
 
-      const complete = await isSeriesSeasonWatchlistItemComplete(candidate).catch(() => false);
-      return complete ? tasks : [];
+      const items = await fetchSeriesSeasonAutoRemoveItems(candidate).catch(() => []);
+      return tasks.filter((task) =>
+        wasContainerCompletedAfterWatchlistTimestamp(items, task.addedAtUtc || task.sharedAtUtc));
     })
   );
 
@@ -1956,8 +1990,8 @@ function ensureStyles() {
     #${WATCHLIST_MODAL_ID} .monwuiwl-close,
     #${WATCHLIST_MODAL_ID} .monwuiwl-tab,
     #${WATCHLIST_MODAL_ID} .monwuiwl-btn,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-submit,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-cancel {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-submit,
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-cancel {
       border: 0;
       cursor: pointer;
       transition: transform .18s ease, background-color .18s ease, opacity .18s ease;
@@ -1972,8 +2006,8 @@ function ensureStyles() {
     }
     #${WATCHLIST_MODAL_ID} .monwuiwl-close:hover,
     #${WATCHLIST_MODAL_ID} .monwuiwl-btn:hover,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-submit:hover,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-cancel:hover {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-submit:hover,
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-cancel:hover {
       transform: translateY(-1px);
     }
     #${WATCHLIST_MODAL_ID} .monwuiwl-smart-fill {
@@ -2087,6 +2121,28 @@ function ensureStyles() {
       align-content: center;
       justify-content: center;
       align-items: center;
+    }
+    #${WATCHLIST_MODAL_ID} .monwui-serr-missing-card .monwui-serr-native-card-btn {
+      align-items: center;
+      background: linear-gradient(135deg, #ffb703, #fb8500);
+      border-radius: 8px;
+      color: #141822;
+      display: flex;
+      height: 40px;
+      justify-content: center;
+      width: 40px;
+      margin-left: 0;
+      margin-top: 0;
+      padding: 0;
+      font-size: inherit;
+      top: auto;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: 15px;
+      border: none;
+      box-shadow: none;
+      position: inherit;
+      opacity: 1
     }
     #${WATCHLIST_MODAL_ID} .monwuiwl-tab {
       padding: 11px 16px;
@@ -2885,12 +2941,15 @@ function ensureStyles() {
       line-height: 1.4;
     }
     #${WATCHLIST_MODAL_ID} .monwuiwl-preview-collection-grid {
+      box-sizing: border-box;
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
+      gap: 12px;
+      min-width: 0;
     }
     #${WATCHLIST_MODAL_ID} .monwuiwl-preview-collection-card {
       appearance: none;
+      box-sizing: border-box;
       display: block;
       width: 100%;
       min-width: 0;
@@ -2920,6 +2979,7 @@ function ensureStyles() {
       outline-offset: 2px;
     }
     #${WATCHLIST_MODAL_ID} .monwuiwl-preview-collection-poster {
+      box-sizing: border-box;
       position: relative;
       overflow: hidden;
       border-radius: 12px;
@@ -3199,9 +3259,9 @@ function ensureStyles() {
     #${WATCHLIST_MODAL_ID} .monwuiwl-item:focus {
       outline: none;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-empty,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-loading,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-error {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-empty,
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-loading,
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-error {
       border: 1px dashed rgba(255,255,255,0.14);
       border-radius: 18px;
       padding: 24px;
@@ -3209,9 +3269,10 @@ function ensureStyles() {
       color: rgba(255,255,255,0.74);
       background: rgba(255,255,255,0.03);
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-overlay {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-overlay {
       position: absolute;
       inset: 0;
+      z-index: 20;
       background: rgba(7, 9, 15, 0.74);
       backdrop-filter: blur(8px);
       display: flex;
@@ -3219,7 +3280,7 @@ function ensureStyles() {
       justify-content: center;
       padding: 20px;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-card {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-card {
       width: min(560px, calc(100vw - 40px));
       max-height: min(82vh, 760px);
       overflow: auto;
@@ -3230,19 +3291,19 @@ function ensureStyles() {
       color: #fff;
       box-shadow: 0 24px 60px rgba(0,0,0,0.42);
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-title {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-title {
       margin: 0 0 6px;
       font-size: 22px;
       font-weight: 800;
       letter-spacing: -0.03em;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-help {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-help {
       color: rgba(255,255,255,0.7);
       font-size: 13px;
       line-height: 1.56;
       margin: 0 0 16px;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-list {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-list {
       display: grid;
       gap: 8px;
       margin-bottom: 16px;
@@ -3250,7 +3311,7 @@ function ensureStyles() {
       overflow: auto;
       padding-right: 4px;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-user {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-user {
       display: flex;
       align-items: center;
       gap: 10px;
@@ -3258,16 +3319,16 @@ function ensureStyles() {
       border-radius: 12px;
       padding: 10px 12px;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-user input {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-user input {
       accent-color: #ffb703;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-note-label {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-note-label {
       display: block;
       font-size: 13px;
       font-weight: 700;
       margin-bottom: 8px;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-note {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-note {
       width: 100%;
       min-height: 120px;
       resize: vertical;
@@ -3280,25 +3341,25 @@ function ensureStyles() {
       box-sizing: border-box;
       outline: none;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-footer {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-footer {
       display: flex;
       gap: 10px;
       justify-content: flex-end;
       margin-top: 16px;
       flex-wrap: wrap;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-submit,
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-cancel {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-submit,
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-cancel {
       border-radius: 12px;
       padding: 11px 14px;
       font-size: 13px;
       font-weight: 800;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-submit {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-submit {
       background: linear-gradient(135deg, #ffb703, #fb8500);
       color: #1b1f28;
     }
-    #${WATCHLIST_MODAL_ID} .monwuiwl-share-cancel {
+    :is(#${WATCHLIST_MODAL_ID}, .monwuiwl-share-host) .monwuiwl-share-cancel {
       background: rgba(255,255,255,0.08);
       color: #fff;
     }
@@ -3314,6 +3375,9 @@ function ensureStyles() {
       }
       #${WATCHLIST_MODAL_ID} .monwuiwl-preview {
         max-height: 56vh;
+      }
+      #${WATCHLIST_MODAL_ID} .monwuiwl-preview-collection-grid {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
       }
     }
     @media (max-width: 760px) {
@@ -3406,7 +3470,7 @@ function ensureStyles() {
         grid-template-columns: 1fr;
       }
       #${WATCHLIST_MODAL_ID} .monwuiwl-preview-collection-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
       }
       #${WATCHLIST_MODAL_ID} .monwuiwl-grid {
         grid-template-columns: 1fr;
@@ -3594,17 +3658,77 @@ function uniqTextList(values = []) {
   return out;
 }
 
+function buildJellyfinImageUrl(itemId, imageType = "Primary", tag = "", { width = 220, height = 320, quality = 90 } = {}) {
+  const cleanId = text(itemId);
+  const cleanType = text(imageType, "Primary");
+  if (!cleanId || !cleanType) return "";
+
+  const params = new URLSearchParams();
+  const cleanTag = text(tag);
+  if (cleanTag) params.set("tag", cleanTag);
+  params.set("fillWidth", String(width));
+  params.set("fillHeight", String(height));
+  params.set("quality", String(quality));
+
+  return withServer(`/Items/${encodeURIComponent(cleanId)}/Images/${encodeURIComponent(cleanType)}?${params.toString()}`);
+}
+
 function buildPosterUrl(item, { width = 220, height = 320, quality = 90 } = {}) {
+  const serrPoster = getSerrMissingSyntheticPosterUrl(item, "w342");
+  if (serrPoster) return serrPoster;
+
+  if (isSerrMissingSyntheticItem(item) && text(item?.__monwuiSerrMissingType) === "season") {
+    const seriesPoster = buildPosterUrl(item?.__monwuiSerrSeriesItem || null, { width, height, quality });
+    if (seriesPoster) return seriesPoster;
+  }
+
   const itemId = text(item?.Id);
   const primaryTag = text(item?.ImageTags?.Primary || item?.PrimaryImageTag || item?.AlbumPrimaryImageTag);
   if (itemId && primaryTag) {
-    return withServer(`/Items/${encodeURIComponent(itemId)}/Images/Primary?tag=${encodeURIComponent(primaryTag)}&fillWidth=${encodeURIComponent(width)}&fillHeight=${encodeURIComponent(height)}&quality=${encodeURIComponent(quality)}`);
+    return buildJellyfinImageUrl(itemId, "Primary", primaryTag, { width, height, quality });
   }
 
   const albumId = text(item?.AlbumId);
   const albumTag = text(item?.AlbumPrimaryImageTag);
   if (albumId && albumTag) {
-    return withServer(`/Items/${encodeURIComponent(albumId)}/Images/Primary?tag=${encodeURIComponent(albumTag)}&fillWidth=${encodeURIComponent(width)}&fillHeight=${encodeURIComponent(height)}&quality=${encodeURIComponent(quality)}`);
+    return buildJellyfinImageUrl(albumId, "Primary", albumTag, { width, height, quality });
+  }
+
+  const itemType = getItemTypeName(item);
+  if (itemType === "season" || itemType === "episode") {
+    const seriesId = text(item?.SeriesId || item?.Series?.Id);
+    const seriesTag = text(
+      item?.SeriesPrimaryImageTag ||
+      item?.Series?.PrimaryImageTag ||
+      item?.Series?.ImageTags?.Primary
+    );
+    if (seriesId && seriesTag) {
+      return buildJellyfinImageUrl(seriesId, "Primary", seriesTag, { width, height, quality });
+    }
+
+    const parentPrimaryId = text(item?.ParentPrimaryImageItemId || item?.ParentId);
+    const parentPrimaryTag = text(item?.ParentPrimaryImageTag);
+    if (parentPrimaryId && parentPrimaryTag) {
+      return buildJellyfinImageUrl(parentPrimaryId, "Primary", parentPrimaryTag, { width, height, quality });
+    }
+
+    const parentThumbId = text(item?.ParentThumbItemId || item?.ParentId);
+    const parentThumbTag = text(item?.ParentThumbImageTag);
+    if (parentThumbId && parentThumbTag) {
+      return buildJellyfinImageUrl(parentThumbId, "Thumb", parentThumbTag, { width, height, quality });
+    }
+
+    if (seriesId) {
+      return buildJellyfinImageUrl(seriesId, "Primary", "", { width, height, quality });
+    }
+
+    if (parentPrimaryId) {
+      return buildJellyfinImageUrl(parentPrimaryId, "Primary", "", { width, height, quality });
+    }
+  }
+
+  if (itemId) {
+    return buildJellyfinImageUrl(itemId, "Primary", "", { width, height, quality });
   }
 
   return "";
@@ -3771,9 +3895,30 @@ function hasPreviewDetails(value) {
   return !!getPreviewPayload(value).details?.Id;
 }
 
+function collectionPreviewNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function collectionPreviewDedupeKey(item) {
+  const type = getItemTypeName(item);
+  if (type === "season") {
+    const seasonNumber = collectionPreviewNumber(item?.IndexNumber ?? item?.indexNumber ?? item?.SeasonNumber ?? item?.seasonNumber);
+    return Number.isFinite(seasonNumber) ? `season:${seasonNumber}` : "";
+  }
+  if (type === "episode") {
+    const seasonNumber = collectionPreviewNumber(item?.ParentIndexNumber ?? item?.parentIndexNumber ?? item?.SeasonNumber ?? item?.seasonNumber);
+    const episodeNumber = collectionPreviewNumber(item?.IndexNumber ?? item?.indexNumber ?? item?.EpisodeNumber ?? item?.episodeNumber);
+    return Number.isFinite(seasonNumber) && Number.isFinite(episodeNumber)
+      ? `episode:${seasonNumber}:${episodeNumber}`
+      : "";
+  }
+  return "";
+}
+
 function normalizeCollectionPreviewItems(items = []) {
   const out = [];
-  const seen = new Set();
+  const seen = new Map();
 
   for (const item of Array.isArray(items) ? items : []) {
     const id = text(item?.Id || item?.id);
@@ -3785,9 +3930,21 @@ function normalizeCollectionPreviewItems(items = []) {
       item?.PrimaryImageTag
     );
     if (!hasRenderableData) continue;
-    if (id) {
-      if (seen.has(id)) continue;
-      seen.add(id);
+    const key = collectionPreviewDedupeKey(item) || (id ? `id:${id}` : "");
+    if (key) {
+      const existingIndex = seen.get(key);
+      if (existingIndex !== undefined) {
+        const existing = out[existingIndex];
+        const existingSynthetic = isSerrMissingSyntheticItem(existing);
+        const currentSynthetic = isSerrMissingSyntheticItem(item);
+        if (existingSynthetic && !currentSynthetic) {
+          out[existingIndex] = item;
+        } else if (existingSynthetic === currentSynthetic && isSerrMissingSyntheticItemRequested(item) && !isSerrMissingSyntheticItemRequested(existing)) {
+          out[existingIndex] = item;
+        }
+        continue;
+      }
+      seen.set(key, out.length);
     }
     out.push(item);
   }
@@ -3799,19 +3956,30 @@ function minimizeCollectionPreviewItems(items = []) {
   return normalizeCollectionPreviewItems(items).map((item) => ({
     Id: item?.Id,
     Name: item?.Name,
+    OriginalTitle: item?.OriginalTitle,
     Type: item?.Type,
+    ProviderIds: item?.ProviderIds || item?.providerIds,
     Overview: item?.Overview,
     ProductionYear: item?.ProductionYear,
+    PremiereDate: item?.PremiereDate,
     CommunityRating: item?.CommunityRating,
+    LocationType: item?.LocationType,
     ImageTags: item?.ImageTags,
     PrimaryImageTag: item?.PrimaryImageTag,
     PrimaryImageAspectRatio: item?.PrimaryImageAspectRatio,
+    SeriesPrimaryImageTag: item?.SeriesPrimaryImageTag,
+    SeriesThumbImageTag: item?.SeriesThumbImageTag,
+    ParentPrimaryImageItemId: item?.ParentPrimaryImageItemId,
+    ParentPrimaryImageTag: item?.ParentPrimaryImageTag,
+    ParentThumbItemId: item?.ParentThumbItemId,
+    ParentThumbImageTag: item?.ParentThumbImageTag,
     UserData: item?.UserData,
     RunTimeTicks: item?.RunTimeTicks,
     CumulativeRunTimeTicks: item?.CumulativeRunTimeTicks,
     ChildCount: item?.ChildCount,
     SeriesId: item?.SeriesId,
     SeriesName: item?.SeriesName,
+    ParentId: item?.ParentId,
     SeasonId: item?.SeasonId,
     IndexNumber: item?.IndexNumber,
     ParentIndexNumber: item?.ParentIndexNumber,
@@ -3838,12 +4006,14 @@ async function getCachedCollectionPreview(itemId) {
 
 function getContainerPreviewFields() {
   return [
-    "Id","Name","Type","Overview","ProductionYear","CommunityRating",
+    "Id","Name","OriginalTitle","Type","ProviderIds","Overview","ProductionYear","PremiereDate",
+    "LocationType","CommunityRating",
     "ImageTags","PrimaryImageTag","PrimaryImageAspectRatio","UserData",
-    "RunTimeTicks","CumulativeRunTimeTicks","ChildCount","SeriesId",
-    "SeriesName","SeasonId","IndexNumber","ParentIndexNumber",
-    "BackdropImageTags","ParentBackdropImageTags","ParentBackdropItemId",
-    "SeriesBackdropImageTag","OfficialRating","Genres"
+    "SeriesPrimaryImageTag","SeriesThumbImageTag","ParentId","ParentPrimaryImageItemId",
+    "ParentPrimaryImageTag","ParentThumbItemId","ParentThumbImageTag","RunTimeTicks",
+    "CumulativeRunTimeTicks","ChildCount","SeriesId","SeriesName","SeasonId",
+    "IndexNumber","ParentIndexNumber","BackdropImageTags","ParentBackdropImageTags",
+    "ParentBackdropItemId","SeriesBackdropImageTag","OfficialRating","Genres"
   ].join(",");
 }
 
@@ -3973,10 +4143,7 @@ function getExpectedContainerPreviewTotal(view, previewData) {
     );
   }
 
-  return Math.max(
-    Number(payload.collectionItemsTotal || 0),
-    normalizeCollectionPreviewItems(payload.collectionItems || []).length
-  );
+  return normalizeCollectionPreviewItems(payload.collectionItems || []).length;
 }
 
 function isContainerPreviewIncomplete(view, previewData) {
@@ -4117,10 +4284,17 @@ function getPreferredVisibleContainerItems(items = [], limit = WATCHLIST_COLLECT
   if (!normalized.length || limit <= 0) return [];
   if (normalized.length <= limit) return normalized.slice(0, limit);
 
+  const missing = normalized.filter((item) => isSerrMissingSyntheticItem(item));
+  const normal = normalized.filter((item) => !isSerrMissingSyntheticItem(item));
+  if (missing.length) {
+    const roomForNormal = Math.max(0, limit - missing.length);
+    return [...normal.slice(0, roomForNormal), ...missing].slice(0, limit);
+  }
+
   const unplayed = [];
   const played = [];
 
-  for (const item of normalized) {
+  for (const item of normal) {
     if (isMarkedPlayed(item)) {
       played.push(item);
     } else {
@@ -4144,13 +4318,32 @@ function renderPlayedOverlayMarkup() {
   `;
 }
 
+function renderSerrMissingOverlayButton(requested = false) {
+  const actionTitle = requested
+    ? L("serrStatusRequested", "İstek")
+    : L("serrRequestButton", "İste");
+  const iconName = requested ? "check" : "playlist_add";
+  const disabled = requested ? " disabled aria-disabled=\"true\"" : "";
+  return `
+    <div class="cardOverlayContainer">
+      <button is="paper-icon-button-light" type="button" class="cardOverlayButton cardOverlayButton-hover paper-icon-button-light monwui-serr-native-card-btn cardOverlayFab-primary" title="${escapeHtml(actionTitle)}" aria-label="${escapeHtml(actionTitle)}"${disabled}>
+        <span class="material-icons cardOverlayButtonIcon cardOverlayButtonIcon-hover ${iconName}" aria-hidden="true"></span>
+      </button>
+    </div>
+  `;
+}
+
 function renderCollectionPreviewCards(items = [], { mode = "collection" } = {}) {
+  ensureSerrMissingVisualStyles();
   const visible = getPreferredVisibleContainerItems(items, WATCHLIST_COLLECTION_PREVIEW_LIMIT);
   if (!visible.length) return "";
 
   return `
     <div class="monwuiwl-preview-collection-grid">
       ${visible.map((item) => {
+        const isMissing = isSerrMissingSyntheticItem(item);
+        const isRequested = isSerrMissingSyntheticItemRequested(item);
+        if (isMissing && item?.Id) serrMissingPreviewItems.set(String(item.Id), item);
         const title = getContainerPreviewCardTitle(item, mode);
         const posterUrl = buildPosterUrl(item, { width: 220, height: 330, quality: 88 });
         const meta = getContainerPreviewCardMeta(item, mode);
@@ -4166,16 +4359,22 @@ function renderCollectionPreviewCards(items = [], { mode = "collection" } = {}) 
         const playLabel = getPlayActionLabel(item);
 
         return `
-          <button
-            type="button"
-            class="monwuiwl-preview-collection-card ${isPlayed ? "is-played" : ""}"
+          <div
+            role="button"
+            tabindex="0"
+            class="monwuiwl-preview-collection-card ${isPlayed ? "is-played" : ""} ${isMissing ? "monwui-serr-missing-card" : ""} ${isRequested ? "monwui-serr-requested" : ""}"
             data-monwuiwl-preview-play="${escapeHtml(item?.Id)}"
+            ${isMissing ? "data-monwui-serr-missing-preview=\"1\"" : ""}
+            ${isRequested ? "data-serr-requested=\"1\"" : ""}
             aria-label="${escapeHtml(`${playLabel}: ${title}`)}"
           >
             <div class="monwuiwl-preview-collection-poster">
+              ${isMissing ? `<span class="monwui-serr-missing-badge">${escapeHtml(L("serrMissingBadge", "Eksik"))}</span>` : ""}
               ${posterUrl
-                ? `<img src="${escapeHtml(posterUrl)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async">`
-                : `<div class="monwuiwl-preview-collection-fallback">${escapeHtml(fallback)}</div>`}
+                ? `<img src="${escapeHtml(posterUrl)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async" onerror="this.remove()">`
+                : ""}
+              <div class="monwuiwl-preview-collection-fallback">${escapeHtml(fallback)}</div>
+              ${isMissing ? renderSerrMissingOverlayButton(isRequested) : ""}
               ${isPlayed ? renderPlayedOverlayMarkup() : ""}
             </div>
             <div class="monwuiwl-preview-collection-main">
@@ -4187,7 +4386,7 @@ function renderCollectionPreviewCards(items = [], { mode = "collection" } = {}) 
                 </div>
               ` : ""}
             </div>
-          </button>
+          </div>
         `;
       }).join("")}
     </div>
@@ -4197,7 +4396,9 @@ function renderCollectionPreviewCards(items = [], { mode = "collection" } = {}) 
 function renderCollectionPreviewSection(items = [], total = 0, { loading = false, mode = "collection" } = {}) {
   const normalized = normalizeCollectionPreviewItems(items);
   const visible = getPreferredVisibleContainerItems(normalized, WATCHLIST_COLLECTION_PREVIEW_LIMIT);
-  const itemCount = Math.max(Number(total || 0), normalized.length);
+  const itemCount = mode === "collection"
+    ? Math.max(Number(total || 0), normalized.length)
+    : normalized.length;
   const hiddenCount = Math.max(0, itemCount - visible.length);
 
   if (!visible.length && !loading) return "";
@@ -4294,7 +4495,7 @@ function createStatsBucketState(tab) {
   return {
     key: tab.key,
     label: L(tab.labelKey, tab.fallback),
-    totalSet: new Set(),
+    summarySet: new Set(),
     activeSet: new Set(),
     completedSet: new Set()
   };
@@ -4311,10 +4512,15 @@ function resolveWatchlistStatsBucket(itemLike) {
   });
 }
 
+function isWatchlistHistoryCompleted(historyEntry) {
+  return historyEntry?.RemovedAfterPlayed === true || historyEntry?.removedAfterPlayed === true;
+}
+
 function buildWatchlistHistorySummary(model, dashboard = dashboardCache) {
   const ownViews = getAllWatchlistContentViews(model, "own");
   const sharedViews = getAllWatchlistContentViews(model, "shared");
   const historyEntries = getWatchlistHistoryEntries(dashboard);
+  const summaryItemIds = new Set();
   const completedItemIds = new Set();
   const removedCompletedItemIds = new Set();
   const buckets = new Map(WATCHLIST_CONTENT_TABS.map((tab) => [tab.key, createStatsBucketState(tab)]));
@@ -4327,11 +4533,12 @@ function buildWatchlistHistorySummary(model, dashboard = dashboardCache) {
 
     const bucketKey = resolveWatchlistStatsBucket(historyEntry);
     const bucket = buckets.get(bucketKey);
-    bucket?.totalSet?.add(itemId);
 
-    if (historyEntry?.RemovedAfterPlayed === true) {
+    if (isWatchlistHistoryCompleted(historyEntry)) {
+      summaryItemIds.add(itemId);
       completedItemIds.add(itemId);
       removedCompletedItemIds.add(itemId);
+      bucket?.summarySet?.add(itemId);
       bucket?.completedSet?.add(itemId);
     }
   }
@@ -4342,6 +4549,8 @@ function buildWatchlistHistorySummary(model, dashboard = dashboardCache) {
 
     const bucketKey = resolveWatchlistStatsBucket(view?.item || {});
     const bucket = buckets.get(bucketKey);
+    summaryItemIds.add(itemId);
+    bucket?.summarySet?.add(itemId);
     bucket?.activeSet?.add(itemId);
 
     const playable = view?.item?.liveItem || view?.item || {};
@@ -4363,7 +4572,7 @@ function buildWatchlistHistorySummary(model, dashboard = dashboardCache) {
 
   return {
     userName: resolvedUserName,
-    totalEverAdded: historyEntries.length,
+    summaryTotalCount: summaryItemIds.size,
     activeOwnCount: ownViews.length,
     completedCount: completedItemIds.size,
     removedCompletedCount: removedCompletedItemIds.size,
@@ -4374,7 +4583,7 @@ function buildWatchlistHistorySummary(model, dashboard = dashboardCache) {
       return {
         key: tab.key,
         label: bucket.label,
-        totalEverAdded: bucket.totalSet.size,
+        summaryCount: bucket.summarySet.size,
         activeCount: bucket.activeSet.size,
         completedCount: bucket.completedSet.size
       };
@@ -4396,8 +4605,8 @@ function renderWatchlistHistoryTypeCard(typeSummary) {
     <article class="monwuiwl-stats-type-card">
       <div class="monwuiwl-stats-type-name">${escapeHtml(typeSummary.label)}</div>
       <div class="monwuiwl-stats-type-total">
-        <span>${escapeHtml(L("watchlistStatsTracked", "Toplam kayıt"))}</span>
-        <strong>${escapeHtml(formatCount(typeSummary.totalEverAdded))}</strong>
+        <span>${escapeHtml(L("watchlistStatsTracked", "Aktif + tamamlanan"))}</span>
+        <strong>${escapeHtml(formatCount(typeSummary.summaryCount))}</strong>
       </div>
       <div class="monwuiwl-stats-type-row">
         <span>${escapeHtml(L("watchlistHistoryActive", "Aktif watchlist"))}</span>
@@ -4598,10 +4807,10 @@ function renderWatchlistHistorySection(model) {
         <div class="monwuiwl-stats-hero-content">
           <div class="monwuiwl-stats-kicker">${escapeHtml(L("watchlistHistoryTitle", "Watchlist Geçmişi"))}</div>
           <h3 class="monwuiwl-stats-user">${escapeHtml(summary.userName)}</h3>
-          <p class="monwuiwl-stats-copy">${escapeHtml(L("watchlistHistorySubtitle", "Aktif listen, kaldırılmış içerikler ve geçmiş toplamlar burada birlikte tutulur."))}</p>
+          <p class="monwuiwl-stats-copy">${escapeHtml(L("watchlistHistorySubtitle", "Aktif listen, tamamlanan içerikler ve paylaşım hareketleri burada özetlenir."))}</p>
           <div class="monwuiwl-stats-total">
-            <span class="monwuiwl-stats-total-label">${escapeHtml(L("watchlistStatsTracked", "Toplam kayıt"))}</span>
-            <strong class="monwuiwl-stats-total-value">${escapeHtml(formatCount(summary.totalEverAdded))}</strong>
+            <span class="monwuiwl-stats-total-label">${escapeHtml(L("watchlistStatsTracked", "Aktif + tamamlanan"))}</span>
+            <strong class="monwuiwl-stats-total-value">${escapeHtml(formatCount(summary.summaryTotalCount))}</strong>
           </div>
         </div>
         <div class="monwuiwl-stats-hero-art" aria-hidden="true">
@@ -4915,11 +5124,13 @@ function renderPreviewPanel(view, details, { loading = false, collectionLoading 
   const hasContainerPreview = !!containerMode;
   const isCollection = containerMode === "collection";
   const collectionItems = normalizeCollectionPreviewItems(previewPayload.collectionItems || []);
-  const collectionTotal = Math.max(
-    Number(previewPayload.collectionItemsTotal || 0),
-    collectionItems.length,
-    isCollection ? Number(item?.ChildCount || baseItem.childCount || baseItem.ChildCount || 0) : 0
-  );
+  const collectionTotal = isCollection
+    ? Math.max(
+        Number(previewPayload.collectionItemsTotal || 0),
+        collectionItems.length,
+        Number(item?.ChildCount || baseItem.childCount || baseItem.ChildCount || 0)
+      )
+    : collectionItems.length;
   const containerCountText = hasContainerPreview ? getContainerPreviewCountText(containerMode, collectionTotal) : "";
   const collectionYears = isCollection ? getCollectionYearRange(collectionItems) : "";
   const collectionWatched = hasContainerPreview ? getCollectionWatchedSummary(collectionItems, collectionTotal) : "";
@@ -4976,7 +5187,6 @@ function renderPreviewPanel(view, details, { loading = false, collectionLoading 
   const progressPercent = runtimeTicks > 0 && playbackTicks > 0
     ? Math.max(0, Math.min(100, Math.round((playbackTicks / runtimeTicks) * 100)))
     : 0;
-
   const stats = isCollection
     ? [
         { label: L("watchlistPreviewCollectionCount", "Öğe"), value: collectionTotal ? `${collectionTotal} ${L("watchlistPreviewCollectionItemSuffix", "öğe")}` : "" },
@@ -5045,8 +5255,9 @@ function renderPreviewPanel(view, details, { loading = false, collectionLoading 
         <div class="monwuiwl-preview-hero-inner">
           <div class="monwuiwl-preview-poster">
             ${posterUrl
-              ? `<img src="${escapeHtml(posterUrl)}" alt="${escapeHtml(title)}" loading="eager" fetchpriority="high" decoding="async">`
-              : `<div class="monwuiwl-preview-poster-fallback">${escapeHtml(itemType)}</div>`}
+              ? `<img src="${escapeHtml(posterUrl)}" alt="${escapeHtml(title)}" loading="eager" fetchpriority="high" decoding="async" onerror="this.remove()">`
+              : ""}
+            <div class="monwuiwl-preview-poster-fallback">${escapeHtml(itemType)}</div>
           </div>
           <div class="monwuiwl-preview-head">
             <div class="monwuiwl-preview-kicker">${escapeHtml(itemType)}</div>
@@ -5195,10 +5406,10 @@ function buildCollectionAutoRemoveTaskKey(view) {
 function getAutoRemoveTasksForView(view) {
   if (!view) return [];
   if (view.kind === "shared" && view.shareId) {
-    return [{ kind: "shared", itemId: text(view.itemId), shareId: text(view.shareId) }];
+    return [{ kind: "shared", itemId: text(view.itemId), shareId: text(view.shareId), sharedAtUtc: Number(view.sharedAtUtc || 0) }];
   }
   if (view.itemId) {
-    return [{ kind: "own", itemId: text(view.itemId) }];
+    return [{ kind: "own", itemId: text(view.itemId), addedAtUtc: Number(view.addedAtUtc || 0) }];
   }
   return [];
 }
@@ -5216,6 +5427,11 @@ async function autoRemoveContainerViewIfNeeded(root, view, previewData) {
 
   const watchedCount = getCollectionWatchedCount(items);
   if (watchedCount < total) return false;
+  const completedAfterAdded = wasContainerCompletedAfterWatchlistTimestamp(
+    items,
+    view.kind === "shared" ? view.sharedAtUtc : view.addedAtUtc
+  );
+  if (!completedAfterAdded) return false;
 
   const autoRemoveKey = buildCollectionAutoRemoveTaskKey(view);
   if (!autoRemoveKey || collectionAutoRemovePending.has(autoRemoveKey)) return false;
@@ -5373,11 +5589,29 @@ async function updatePreviewPanel(root, itemId) {
     return;
   }
 
+  const containerSource = details?.Id ? details : (cachedPayload.details?.Id ? cachedPayload.details : {
+    Id: normalizedId,
+    Type: text(cachedPayload.details?.Type || view?.item?.itemType)
+  });
+  let nextCollectionItems = Array.isArray(collectionResult?.items) ? collectionResult.items : cachedPayload.collectionItems;
+  if (collectionResult?.loaded === true && text(collectionResult?.source) === "live" && getPreviewContainerMode(containerSource)) {
+    const missingItems = await getSerrMissingSyntheticItems(containerSource, nextCollectionItems, {
+      mode: getPreviewContainerMode(containerSource),
+      signal: controller.signal
+    }).catch(() => []);
+    if (missingItems.length) nextCollectionItems = [...nextCollectionItems, ...missingItems];
+  }
+  nextCollectionItems = normalizeCollectionPreviewItems(nextCollectionItems);
+  const nextContainerMode = getPreviewContainerMode(containerSource);
+  const nextCollectionTotal = nextContainerMode === "collection"
+    ? Math.max(Number(collectionResult?.total || cachedPayload.collectionItemsTotal || 0), nextCollectionItems.length)
+    : nextCollectionItems.length;
+
   const nextPayload = createPreviewPayload({
     ...cachedPayload,
     details: details?.Id ? details : cachedPayload.details,
-    collectionItems: Array.isArray(collectionResult?.items) ? collectionResult.items : cachedPayload.collectionItems,
-    collectionItemsTotal: Number(collectionResult?.total || cachedPayload.collectionItemsTotal || 0),
+    collectionItems: nextCollectionItems,
+    collectionItemsTotal: nextCollectionTotal,
     collectionItemsLoaded: collectionResult?.loaded === true || cachedPayload.collectionItemsLoaded,
     collectionItemsStale: collectionResult?.stale === true,
     collectionItemsUpdatedAt: Number(collectionResult?.updatedAt || cachedPayload.collectionItemsUpdatedAt || 0),
@@ -5492,9 +5726,9 @@ async function buildViewModel(dashboard) {
 
   const model = createEmptyWatchlistModel();
   const autoRemovalTasks = [];
-  const completedSeriesSeasonIds = shouldAutoRemovePlayedFromWatchlist()
-    ? await getCompletedSeriesSeasonWatchlistItemIds(dashboard, found).catch(() => new Set())
-    : new Set();
+  const completedSeriesSeasonPlayedAt = shouldAutoRemovePlayedFromWatchlist()
+    ? await getCompletedSeriesSeasonWatchlistItemPlayedAt(dashboard, found).catch(() => new Map())
+    : new Map();
 
   for (const entry of dashboard?.myItems || []) {
     const itemId = text(entry?.ItemId || entry?.itemId);
@@ -5506,7 +5740,7 @@ async function buildViewModel(dashboard) {
       autoRemovalTasks.push({ kind: "own", itemId });
       continue;
     }
-    if (completedSeriesSeasonIds.has(itemId)) {
+    if ((completedSeriesSeasonPlayedAt.get(itemId) || 0) > addedAtUtc) {
       autoRemovalTasks.push({ kind: "own", itemId });
       continue;
     }
@@ -5534,7 +5768,7 @@ async function buildViewModel(dashboard) {
       autoRemovalTasks.push({ kind: "shared", itemId, shareId });
       continue;
     }
-    if (completedSeriesSeasonIds.has(itemId)) {
+    if ((completedSeriesSeasonPlayedAt.get(itemId) || 0) > sharedAtUtc) {
       autoRemovalTasks.push({ kind: "shared", itemId, shareId });
       continue;
     }
@@ -5719,6 +5953,7 @@ function mergePartialWatchlistItemModel(model, partialModel, detail = {}) {
 }
 
 function renderShareSummary(outgoingShares = []) {
+  if (!isWatchlistSharingEnabled()) return "";
   if (!Array.isArray(outgoingShares) || !outgoingShares.length) return "";
   const names = outgoingShares
     .map((share) => text(share?.TargetUserName || share?.targetUserName))
@@ -5770,7 +6005,7 @@ function renderItemCard(view) {
     ? `<div class="monwuiwl-item-sharemeta">${escapeHtml(L("watchlistSharedBy", "Paylaşan"))}: ${escapeHtml(view.ownerUserName)}${view.sharedAtUtc ? ` • ${escapeHtml(formatDate(view.sharedAtUtc))}` : ""}</div>`
     : renderShareSummary(view.outgoingShares);
 
-  const secondaryAction = view.kind === "own"
+  const secondaryAction = view.kind === "own" && isWatchlistSharingEnabled()
     ? `<button class="monwuiwl-btn" data-monwuiwl-share="${escapeHtml(view.itemId)}">${escapeHtml(L("watchlistShareAction", "Paylaş"))}</button>`
     : "";
 
@@ -6629,6 +6864,18 @@ function bindModalInteractions(root) {
     syncSmartFillButtonState(root);
   });
 
+  root.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;
+    if (event.target?.closest?.(".monwui-serr-native-card-btn")) return;
+
+    const previewPlayButton = event.target?.closest?.("[data-monwuiwl-preview-play]");
+    if (!previewPlayButton || !root.contains(previewPlayButton)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    previewPlayButton.click();
+  });
+
   root.addEventListener("click", async (event) => {
     if (event.target?.closest?.("[data-monwuiwl-close='1']")) return;
 
@@ -6772,6 +7019,10 @@ function bindModalInteractions(root) {
 
       const itemId = text(previewPlayButton.getAttribute("data-monwuiwl-preview-play"));
       if (!itemId) return;
+      if (previewPlayButton.getAttribute("data-monwui-serr-missing-preview") === "1") {
+        await requestSerrMissingSyntheticItem(serrMissingPreviewItems.get(itemId), { button: previewPlayButton.querySelector(".monwui-serr-native-card-btn") });
+        return;
+      }
       await startWatchlistPlayback(previewPlayButton, itemId);
       return;
     }
@@ -6830,7 +7081,31 @@ function bindModalInteractions(root) {
   });
 }
 
+function createShareViewFromItem(item, itemId) {
+  const id = text(item?.Id || item?.ItemId || item?.itemId || itemId);
+  const snapshot = snapshotFromItem(item, id);
+  const merged = mergeLiveItem(snapshot, item || snapshot);
+  return {
+    kind: "own",
+    key: `direct:${id}`,
+    itemId: id,
+    item: merged
+  };
+}
+
+function normalizeShareOverlayHost(root) {
+  return root && typeof root.appendChild === "function" && root.classList
+    ? root
+    : document.body;
+}
+
 async function openShareOverlay(root, itemId) {
+  ensureStyles();
+  if (!isWatchlistSharingEnabled()) {
+    window.showMessage?.(L("watchlistSharingDisabled", "İzleme listesi paylaşımı kapalı"), "info");
+    return;
+  }
+
   const users = await fetchShareableUsers();
   const model = root.__model || {};
   const activeTab = normalizeWatchlistTabKey(root.__state?.activeTab);
@@ -6847,6 +7122,27 @@ async function openShareOverlay(root, itemId) {
     return;
   }
 
+  openShareOverlayForView(root, itemId, view, users);
+}
+
+export async function openWatchlistShareOverlayForItem(item, options = {}) {
+  ensureStyles();
+  if (!isWatchlistSharingEnabled()) {
+    throw new Error(L("watchlistSharingDisabled", "İzleme listesi paylaşımı kapalı"));
+  }
+
+  const itemId = text(options?.itemId || item?.Id || item?.ItemId || item?.itemId);
+  if (!itemId) throw new Error("itemId gerekli");
+
+  const users = await fetchShareableUsers();
+  const view = createShareViewFromItem(item, itemId);
+  openShareOverlayForView(options?.root || options?.host || document.body, itemId, view, users, { item });
+}
+
+function openShareOverlayForView(root, itemId, view, users, options = {}) {
+  const host = normalizeShareOverlayHost(root);
+  const addedHostClass = !host.classList.contains("monwuiwl-share-host");
+  host.classList.add("monwuiwl-share-host");
   const shareTitle = getShareOverlayTitle(view);
 
   const overlay = document.createElement("div");
@@ -6875,7 +7171,12 @@ async function openShareOverlay(root, itemId) {
     </div>
   `;
 
-  const closeOverlay = () => overlay.remove();
+  const closeOverlay = () => {
+    overlay.remove();
+    if (addedHostClass && !host.querySelector(".monwuiwl-share-overlay")) {
+      host.classList.remove("monwuiwl-share-host");
+    }
+  };
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay) closeOverlay();
   });
@@ -6897,7 +7198,10 @@ async function openShareOverlay(root, itemId) {
     try {
       submitButton.disabled = true;
       const selectedUsers = users.filter((user) => selectedIds.includes(user.id));
-      await shareWatchlistItem(itemId, selectedUsers, note);
+      await shareWatchlistItem(itemId, selectedUsers, note, {
+        item: options?.item,
+        snapshot: options?.snapshot
+      });
       window.showMessage?.(L("watchlistSharedSuccess", "Öğe kullanıcılarla paylaşıldı"), "success");
       closeOverlay();
     } catch (error) {
@@ -6907,7 +7211,7 @@ async function openShareOverlay(root, itemId) {
     }
   });
 
-  root.appendChild(overlay);
+  host.appendChild(overlay);
 }
 
 export async function openWatchlistModal(options = {}) {

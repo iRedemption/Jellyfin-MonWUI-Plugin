@@ -11,6 +11,7 @@ import { isRadioTrack } from "./radio.js";
 const config = getConfig();
 const BATCH_SIZE = config.gruplimit;
 const EXCLUDED_LISTS_HISTORY = config.historylimit;
+const GMMP_TRACK_FIELDS = "Name,Artists,Album,AlbumId,AlbumArtist,AlbumArtistId,ArtistItems,RunTimeTicks,ImageTags,MediaStreams,MediaSources,UserData";
 
 let excludedTrackHistory = new Set();
 let currentRefreshCtrl = null;
@@ -461,68 +462,115 @@ function isAudioItem(it) {
   return t === "Audio" || t === "MusicVideo" || String(it?.MediaType || "") === "Audio";
 }
 
+function normalizePlayableTracks(items = []) {
+  return (Array.isArray(items) ? items : []).filter(isAudioItem);
+}
+
+async function activateTrackList(tracks, { revealPlayer = true } = {}) {
+  const playableTracks = normalizePlayableTracks(tracks);
+  if (!playableTracks.length) return false;
+
+  const ok = await ensureGmmpReady();
+  if (!ok) return false;
+
+  musicPlayerState.playlist = playableTracks;
+  musicPlayerState.originalPlaylist = [...playableTracks];
+  musicPlayerState.effectivePlaylist = [...playableTracks];
+  musicPlayerState.currentIndex = 0;
+
+  if (revealPlayer) {
+    try {
+      musicPlayerState.isPlayerVisible = true;
+      musicPlayerState.modernPlayer?.classList?.add("visible");
+      musicPlayerState.modernPlayer?.removeAttribute?.("aria-hidden");
+      musicPlayerState.modernPlayer && (musicPlayerState.modernPlayer.inert = false);
+    } catch {}
+  }
+
+  playTrack(0);
+  return true;
+}
+
+async function fetchAudioItems(queryPath) {
+  const response = await makeApiRequest(queryPath).catch(() => null);
+  return normalizePlayableTracks(response?.Items || []);
+}
+
 export async function playTrackById(itemId, { revealPlayer = true } = {}) {
   if (!itemId) return false;
 
   const ok = await ensureGmmpReady();
   if (!ok) return false;
 
-  const it = await makeApiRequest(`/Items/${encodeURIComponent(String(itemId).trim())}?Fields=Name,Artists,Album,RunTimeTicks,ImageTags,MediaStreams,UserData`).catch(() => null);
+  const it = await makeApiRequest(`/Items/${encodeURIComponent(String(itemId).trim())}?Fields=${encodeURIComponent(GMMP_TRACK_FIELDS)}`).catch(() => null);
   if (!it || !isAudioItem(it)) return false;
 
-  musicPlayerState.playlist = [it];
-  musicPlayerState.originalPlaylist = [it];
-  musicPlayerState.effectivePlaylist = [it];
-  musicPlayerState.currentIndex = 0;
-
-  if (revealPlayer) {
-    try {
-      musicPlayerState.isPlayerVisible = true;
-      musicPlayerState.modernPlayer?.classList?.add("visible");
-      musicPlayerState.modernPlayer?.removeAttribute?.("aria-hidden");
-      musicPlayerState.modernPlayer && (musicPlayerState.modernPlayer.inert = false);
-    } catch {}
-  }
-
-  playTrack(0);
-  return true;
-}
-
-function isTrackItem(it) {
-  const t = String(it?.Type || "");
-  return t === "Audio" || t === "MusicVideo" || String(it?.MediaType || "") === "Audio";
+  return activateTrackList([it], { revealPlayer });
 }
 
 export async function playAlbumById(albumId, { revealPlayer = true, limit = 2000 } = {}) {
   if (!albumId) return false;
 
-  const ok = await ensureGmmpReady();
-  if (!ok) return false;
-
-  const resp = await makeApiRequest(
+  const tracks = await fetchAudioItems(
     `/Items?ParentId=${encodeURIComponent(String(albumId).trim())}` +
     `&IncludeItemTypes=Audio&Recursive=true&SortBy=IndexNumber,SortName&Limit=${encodeURIComponent(String(limit))}` +
-    `&Fields=Name,Artists,Album,RunTimeTicks,ImageTags,MediaStreams,UserData`
-  ).catch(() => null);
+    `&Fields=${encodeURIComponent(GMMP_TRACK_FIELDS)}`
+  );
 
-  const items = Array.isArray(resp?.Items) ? resp.Items : [];
-  const tracks = items.filter(isTrackItem);
-  if (!tracks.length) return false;
+  return activateTrackList(tracks, { revealPlayer });
+}
 
-  musicPlayerState.playlist = tracks;
-  musicPlayerState.originalPlaylist = [...tracks];
-  musicPlayerState.effectivePlaylist = [...tracks];
-  musicPlayerState.currentIndex = 0;
+export async function playFolderById(folderId, { revealPlayer = true, limit = 2000 } = {}) {
+  if (!folderId) return false;
 
-  if (revealPlayer) {
-    try {
-      musicPlayerState.isPlayerVisible = true;
-      musicPlayerState.modernPlayer?.classList?.add("visible");
-      musicPlayerState.modernPlayer?.removeAttribute?.("aria-hidden");
-      musicPlayerState.modernPlayer && (musicPlayerState.modernPlayer.inert = false);
-    } catch {}
+  const tracks = await fetchAudioItems(
+    `/Items?ParentId=${encodeURIComponent(String(folderId).trim())}` +
+    `&IncludeItemTypes=Audio&Recursive=true&SortBy=AlbumArtist,Album,ParentIndexNumber,IndexNumber,SortName&Limit=${encodeURIComponent(String(limit))}` +
+    `&Fields=${encodeURIComponent(GMMP_TRACK_FIELDS)}`
+  );
+
+  return activateTrackList(tracks, { revealPlayer });
+}
+
+export async function playArtistById(artistId, { revealPlayer = true, limit = 2000 } = {}) {
+  if (!artistId) return false;
+
+  const id = encodeURIComponent(String(artistId).trim());
+  const common =
+    `IncludeItemTypes=Audio&Recursive=true&SortBy=Album,ParentIndexNumber,IndexNumber,SortName&Limit=${encodeURIComponent(String(limit))}` +
+    `&Fields=${encodeURIComponent(GMMP_TRACK_FIELDS)}`;
+
+  let tracks = await fetchAudioItems(`/Items?ArtistIds=${id}&${common}`);
+  if (!tracks.length) {
+    tracks = await fetchAudioItems(`/Items?AlbumArtistIds=${id}&${common}`);
+  }
+  if (!tracks.length) {
+    tracks = await fetchAudioItems(
+      `/Items?ParentId=${id}&IncludeItemTypes=Audio&Recursive=true&SortBy=Album,ParentIndexNumber,IndexNumber,SortName&Limit=${encodeURIComponent(String(limit))}` +
+      `&Fields=${encodeURIComponent(GMMP_TRACK_FIELDS)}`
+    );
   }
 
-  playTrack(0);
-  return true;
+  return activateTrackList(tracks, { revealPlayer });
+}
+
+export async function playPlaylistById(playlistId, { revealPlayer = true } = {}) {
+  if (!playlistId) return false;
+
+  let tracks = [];
+  try {
+    tracks = normalizePlayableTracks(await getPlaylistItems(String(playlistId).trim()));
+  } catch {
+    tracks = [];
+  }
+
+  if (!tracks.length) {
+    tracks = await fetchAudioItems(
+      `/Items?ParentId=${encodeURIComponent(String(playlistId).trim())}` +
+      `&IncludeItemTypes=Audio&Recursive=true&SortBy=IndexNumber,SortName&Limit=2000` +
+      `&Fields=${encodeURIComponent(GMMP_TRACK_FIELDS)}`
+    );
+  }
+
+  return activateTrackList(tracks, { revealPlayer });
 }

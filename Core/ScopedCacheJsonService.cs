@@ -251,6 +251,12 @@ namespace Jellyfin.Plugin.JMSFusion.Core
         {
             if (VolatileCacheFields.Contains(propertyName))
             {
+                if (string.Equals(cacheType, "sliderCache", StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(propertyName, "expiresAt", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
                 return true;
             }
 

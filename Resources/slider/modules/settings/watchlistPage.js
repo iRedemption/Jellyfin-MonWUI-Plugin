@@ -15,6 +15,24 @@ export function createWatchlistPanel(config, labels) {
         )
     );
 
+    const sharingCheckbox = createCheckbox(
+        "watchlistSharingEnabled",
+        labels.watchlistSharingEnabled || "İzleme listesi paylaşımını etkinleştir",
+        config.watchlistSharingEnabled !== false
+    );
+    sharingCheckbox.classList.add("watchlist-sharing-container");
+
+    const sharingDescription = document.createElement("div");
+    sharingDescription.className = "description-text";
+    sharingDescription.textContent = labels.watchlistSharingEnabledDescription
+        || "Kapalıyken izleme listesi ve detay penceresindeki paylaşım düğmeleri gizlenir; kullanıcı seçme penceresi açılmaz.";
+
+    const sharingWrapper = document.createElement("div");
+    sharingWrapper.className = "watchlist-sharing-wrapper";
+    sharingWrapper.appendChild(sharingCheckbox);
+    sharingWrapper.appendChild(sharingDescription);
+    section.appendChild(sharingWrapper);
+
     section.appendChild(
         createCheckbox(
             "watchlistAutoRemovePlayed",

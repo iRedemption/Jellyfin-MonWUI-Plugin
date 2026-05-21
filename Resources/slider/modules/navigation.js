@@ -204,9 +204,6 @@ function isLowPowerPeakRuntime() {
     const autoMobileProfile = getDeviceProfileAuto() === 'mobile';
     const touchOnlyLikeMobile = (coarse || anyCoarse || IS_TOUCH) && !fine;
 
-    // Touch-enabled desktop/laptop devices can expose maxTouchPoints > 0 even when
-    // they should still use the desktop peak layout. Gate low-power mode behind the
-    // mobile profile heuristic so diagonal neighbor counts are not collapsed to 1/1.
     return autoMobileProfile && (
       !!window.ReactNativeWebView ||
       uaMobile ||

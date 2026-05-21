@@ -1,6 +1,6 @@
 import { getConfig } from "./config.js";
 import { applyContainerStyles } from "./positionUtils.js";
-import { fetchItemDetails } from "../../Plugins/JMSFusion/runtime/api.js";
+import { fetchItemDetailsFromSliderCache } from "./sliderCache.js";
 import { calculateMatchPercentage } from "./hoverTrailerModal.js";
 import { withServer } from "./jfUrl.js";
 import { getTomatoIconHtml } from "./customIcons.js";
@@ -45,7 +45,7 @@ function applyMetaIconColors(container, itemSeed = "") {
   if (!container) return;
   if (!config?.metaIconColors) return;
 
-  container.querySelectorAll(".monwui-meta-container i").forEach((icon, index) => {
+  container.querySelectorAll("i").forEach((icon, index) => {
     const cls = icon.className || "";
     const isHeartIcon =
       cls.includes("fa-heart") ||
@@ -276,7 +276,7 @@ export function ensureVideoQualityBadgeStyles() {
     }
     .monwui-dot-quality-badge,
     .mini-quality-inline,
-    .monwui-meta-container .video-quality,
+    .monwui-format-container .video-quality,
     .quality-badge .quality-text,
     .jf-notif-item .quality,
     .jf-resume-card .quality {
@@ -331,12 +331,7 @@ export function createLogoContainer() {
   return container;
 }
 
-export function createStatusContainer(itemType, config, UserData, ChildCount, RunTimeTicks, MediaStreams) {
-  const statusContainer = document.createElement("div");
-  statusContainer.className = "monwui-status-container";
-  applyContainerStyles(statusContainer, 'status');
-  const hasResumeProgress = !Array.isArray(RunTimeTicks) && hasPartialPlayback(UserData, RunTimeTicks);
-
+function createTypeSpan(itemType, config, ChildCount) {
   if (itemType && config.showTypeInfo) {
     const typeSpan = document.createElement("span");
     typeSpan.className = "type";
@@ -356,8 +351,48 @@ export function createStatusContainer(itemType, config, UserData, ChildCount, Ru
       typeText += ` (${ChildCount} ${config.languageLabels.seri})`;
     }
     typeSpan.innerHTML = `${typeInfo.icon}${buildMetaTextSpan(typeText, "monwui-type-text")}`;
-    statusContainer.appendChild(typeSpan);
+    return typeSpan;
   }
+
+  return null;
+}
+
+function createQualitySpan(config, MediaStreams) {
+  const videoStream = MediaStreams ? MediaStreams.find(s => s.Type === "Video") : null;
+  if (videoStream && config.showQualityInfo) {
+    const qualityHtml = getVideoQualityText(videoStream, MediaStreams);
+    if (qualityHtml) {
+      const qualitySpan = document.createElement("span");
+      qualitySpan.className = "video-quality";
+      qualitySpan.innerHTML = qualityHtml;
+      return qualitySpan;
+    }
+  }
+
+  return null;
+}
+
+export function createFormatContainer(itemType, config, ChildCount, MediaStreams, itemSeed = "") {
+  const formatContainer = document.createElement("div");
+  formatContainer.className = "monwui-format-container";
+  applyContainerStyles(formatContainer, 'format');
+
+  const typeSpan = createTypeSpan(itemType, config, ChildCount);
+  if (typeSpan) formatContainer.appendChild(typeSpan);
+
+  const qualitySpan = createQualitySpan(config, MediaStreams);
+  if (qualitySpan) formatContainer.appendChild(qualitySpan);
+
+  if (!formatContainer.childElementCount) return null;
+  applyMetaIconColors(formatContainer, itemSeed);
+  return formatContainer;
+}
+
+export function createStatusContainer(config, UserData, RunTimeTicks) {
+  const statusContainer = document.createElement("div");
+  statusContainer.className = "monwui-status-container";
+  applyContainerStyles(statusContainer, 'status');
+  const hasResumeProgress = !Array.isArray(RunTimeTicks) && hasPartialPlayback(UserData, RunTimeTicks);
 
   if (UserData && config.showWatchedInfo) {
     const watchedSpan = document.createElement("span");
@@ -432,18 +467,34 @@ export function createStatusContainer(itemType, config, UserData, ChildCount, Ru
     statusContainer.appendChild(runtimeSpan);
   }
 
-  const videoStream = MediaStreams ? MediaStreams.find(s => s.Type === "Video") : null;
-  if (videoStream && config.showQualityInfo) {
-    const qualityHtml = getVideoQualityText(videoStream, MediaStreams);
-    if (qualityHtml) {
-      const qualitySpan = document.createElement("span");
-      qualitySpan.className = "video-quality";
-      qualitySpan.innerHTML = qualityHtml;
-      statusContainer.appendChild(qualitySpan);
+  return statusContainer.childElementCount ? statusContainer : null;
+}
+
+function getPeopleArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+async function resolvePeopleForItem(People, item) {
+  const directPeople = getPeopleArray(People);
+  if (directPeople.length) return directPeople;
+
+  const embeddedSeriesPeople = getPeopleArray(item?.SeriesData?.People);
+  if (embeddedSeriesPeople.length) return embeddedSeriesPeople;
+
+  if (
+    (item?.Type === "Episode" || item?.Type === "Season") &&
+    item?.SeriesId
+  ) {
+    try {
+      const parent = await fetchItemDetailsFromSliderCache(item.SeriesId);
+      const parentPeople = getPeopleArray(parent?.People);
+      if (parentPeople.length) return parentPeople;
+    } catch (e) {
+      console.warn("Ana dizi bilgileri alınamadı:", e);
     }
   }
 
-  return statusContainer;
+  return directPeople;
 }
 
 export async function createActorSlider(People, config, item) {
@@ -453,22 +504,7 @@ export async function createActorSlider(People, config, item) {
     return emptyDiv;
   }
 
-  let actualPeople = People;
-
-  if (
-    (item.Type === "Episode" || item.Type === "Season") &&
-    item.SeriesId &&
-    (!Array.isArray(actualPeople) || actualPeople.length === 0)
-  ) {
-    try {
-      const parent = await fetchItemDetails(item.SeriesId);
-      if (parent && Array.isArray(parent.People)) {
-        actualPeople = parent.People;
-      }
-    } catch (e) {
-      console.warn("Ana dizi bilgileri alınamadı:", e);
-    }
-  }
+  const actualPeople = await resolvePeopleForItem(People, item);
 
   const allActors = (actualPeople || []).filter(p => p.Type === "Actor");
   const actorsForSlide = allActors.slice(0, config.artistLimit || 9);
@@ -717,22 +753,7 @@ export async function createDirectorContainer({ config, People, item }) {
   container.className = "monwui-director-container";
   applyContainerStyles(container, 'director');
 
-  let actualPeople = People;
-
-  if (
-    (item.Type === "Episode" || item.Type === "Season") &&
-    item.SeriesId &&
-    (!Array.isArray(actualPeople) || actualPeople.length === 0)
-  ) {
-    try {
-      const parent = await fetchItemDetails(item.SeriesId);
-      if (parent && Array.isArray(parent.People)) {
-        actualPeople = parent.People;
-      }
-    } catch (e) {
-      console.warn("Ana dizi bilgileri alınamadı:", e);
-    }
-  }
+  const actualPeople = await resolvePeopleForItem(People, item);
 
   if (actualPeople && actualPeople.length > 0 && config.showDirectorWriter) {
     if (config.showDirector) {

@@ -99,9 +99,6 @@ const HOVER_MODE = (config.recentRowsHoverPreviewMode === "studioMini" || config
   : "inherit";
 const HOME_DEBUG_STORAGE_KEY = "jms:debug:home-sections";
 const HOME_TRACE_STORAGE_KEY = "jms:trace:home-sections";
-// Recent rows can expand into many sub-sections. The generic release gate is
-// useful for very long home pages, but on this module it can stall lower rows
-// behind the first visible ones and make them appear nondeterministic.
 const RECENT_ROWS_EAGER_RELEASE_COUNT = 1024;
 const RECENT_ROWS_RELEASE_ROOT_MARGIN = IS_MOBILE
   ? (IS_MOBILE_WEBVIEW ? "0px 0px 78% 0px" : "0px 0px 60% 0px")
@@ -288,18 +285,35 @@ const RECENT_ROW_SECTION_META = Object.freeze({
 
 const TTL_RECENT_MS   = Number.isFinite(config.recentRowsCacheTTLms) ? Math.max(5_000, config.recentRowsCacheTTLms|0) : 90_000;
 const TTL_CONTINUE_MS = Number.isFinite(config.continueRowsCacheTTLms) ? Math.max(5_000, config.continueRowsCacheTTLms|0) : 45_000;
-const TTL_TOP10_MS    = 2 * 60 * 60 * 1000;
+const TTL_TOP10_MS    = 4 * 60 * 60 * 1000;
 const TOP10_CACHE_POOL_SIZE = 20;
 const TOP_RANK_QUERY_POOL_MULTIPLIER = 4;
 const TMDB_TOP_MOVIE_POOL_SIZE = 240;
 const TMDB_TOP_RATED_PAGE_LIMIT = 8;
 const TMDB_RECENT_RELEASE_WINDOW_DAYS = 70;
-const TMDB_TRAILER_ROW_CACHE_KEY = "jms:recentRows:tmdb-trailers:v3";
+const TMDB_UPCOMING_RELEASE_WINDOW_DAYS = 365;
+const TMDB_TRAILER_ROW_CACHE_KEY = "jms:recentRows:tmdb-trailers:v5";
 const TMDB_TOP_MOVIE_LOOKUP_MIN = 120;
 const TMDB_API_KEY_CACHE_TTL_MS = 60 * 1000;
 const TOP_RANK_PROFILE_TTL_MS = 10 * 60 * 1000;
 const TOP_RANK_GENRE_WEIGHTS = Object.freeze([1, 0.86, 0.74, 0.62, 0.5]);
 const FAMILY_FRIENDLY_RATINGS = new Set(["G", "PG", "TV-G", "TV-PG"]);
+const TMDB_TRAILER_ADULT_MARKERS = Object.freeze([
+  "porn",
+  "porno",
+  "pornographic",
+  "xxx",
+  "adult film",
+  "adult movie",
+  "erotic",
+  "erotica",
+  "erotik",
+  "softcore",
+  "hardcore",
+  "hentai",
+  "onlyfans",
+  "jav "
+]);
 
 const __topRankProfileCache = new Map();
 let __tmdbApiKeyCacheValue = "";
@@ -709,7 +723,6 @@ function sameIdList(a, b) {
         radial-gradient(circle at 82% 14%, rgba(255,163,93,.15), rgba(255,163,93,0) 30%),
         linear-gradient(180deg, rgba(22,20,36,.97), rgba(10,11,20,.96) 34%, rgba(6,6,11,.99));
       border-color: rgba(255,142,102,.28);
-      box-shadow: 0 18px 34px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.08);
       overflow: hidden;
     }
     [id^="tmdb-trailer-rows--"] .top10-card .cardImageContainer:before {
@@ -2175,6 +2188,74 @@ function resolveTmdbRowLocale() {
   return resolveCinemaPreRollLocale(getLiveConfig());
 }
 
+function getTmdbTrailerCurrentUserIdSafe() {
+  try {
+    const sessionUserId = String(getSessionInfo?.()?.userId || getSessionInfo?.()?.UserId || "").trim();
+    if (sessionUserId) return sessionUserId;
+  } catch {}
+
+  try {
+    const api = window.ApiClient || window.apiClient || window.MediaBrowser?.ApiClient || null;
+    return String(
+      (typeof api?.getCurrentUserId === "function" ? api.getCurrentUserId() : "") ||
+      api?._currentUserId ||
+      api?._currentUser?.Id ||
+      api?._serverInfo?.UserId ||
+      ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+function getTmdbTrailerAccessTokenSafe() {
+  try {
+    const api = window.ApiClient || window.apiClient || window.MediaBrowser?.ApiClient || null;
+    return String(
+      (typeof api?.accessToken === "function" ? api.accessToken() : "") ||
+      api?._serverInfo?.AccessToken ||
+      api?._accessToken ||
+      api?._authToken ||
+      ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+function buildTmdbTrailerRowCacheKey(locale) {
+  const userId = getTmdbTrailerCurrentUserIdSafe() || "anon";
+  return `${String(locale?.cacheKey || "default").trim() || "default"}:user:${userId}`;
+}
+
+function buildTmdbTrailerFetchHeaders() {
+  const headers = { Accept: "application/json" };
+  const userId = getTmdbTrailerCurrentUserIdSafe();
+  const token = getTmdbTrailerAccessTokenSafe();
+  if (userId) {
+    headers["X-Emby-UserId"] = userId;
+    headers["X-MediaBrowser-UserId"] = userId;
+  }
+  if (token) {
+    headers["X-Emby-Token"] = token;
+  }
+  return headers;
+}
+
+function looksAdultTmdbTrailerItem(item) {
+  if (item?.adult === true || item?.Adult === true) return true;
+  const text = [
+    item?.title,
+    item?.Title,
+    item?.videoName,
+    item?.VideoName,
+    item?.overview,
+    item?.Overview
+  ].map((value) => String(value || "").trim()).join(" ").toLowerCase();
+  if (!text) return false;
+  return TMDB_TRAILER_ADULT_MARKERS.some((marker) => text.includes(marker));
+}
+
 function readTmdbTrailerRowCache(cacheKey) {
   try {
     const raw = localStorage.getItem(TMDB_TRAILER_ROW_CACHE_KEY);
@@ -2224,6 +2305,14 @@ function getTmdbTrailerReleaseState(result) {
   return "";
 }
 
+function isCurrentTmdbTrailerRelease(result) {
+  const releaseTs = toTimestamp(result?.releaseDate || result?.release_date);
+  if (!releaseTs) return false;
+  const dayDiff = Math.ceil((releaseTs - Date.now()) / 86_400_000);
+  return dayDiff >= (-TMDB_RECENT_RELEASE_WINDOW_DAYS)
+    && dayDiff <= TMDB_UPCOMING_RELEASE_WINDOW_DAYS;
+}
+
 function getTmdbTrailerReleaseLabel(state) {
   const ll = config?.languageLabels || {};
   if (state === "upcoming") {
@@ -2263,9 +2352,19 @@ function normalizeTmdbTrailerCacheItems(payload) {
       releaseDate: String(item?.releaseDate ?? item?.ReleaseDate ?? "").trim(),
       backdropUrl: String(item?.backdropUrl ?? item?.BackdropUrl ?? "").trim(),
       posterUrl: String(item?.posterUrl ?? item?.PosterUrl ?? "").trim(),
-      sourceList: String(item?.sourceList ?? item?.SourceList ?? "").trim()
+      sourceList: String(item?.sourceList ?? item?.SourceList ?? "").trim(),
+      originalLanguage: String(item?.originalLanguage ?? item?.OriginalLanguage ?? "").trim(),
+      officialRating: String(item?.officialRating ?? item?.OfficialRating ?? "").trim(),
+      ratingScore: Number(item?.ratingScore ?? item?.RatingScore),
+      ratingSubScore: Number(item?.ratingSubScore ?? item?.RatingSubScore),
+      certificationCountry: String(item?.certificationCountry ?? item?.CertificationCountry ?? "").trim(),
+      adult: item?.adult === true || item?.Adult === true
     }))
-    .filter((item) => Number.isFinite(item.tmdbId) && item.youtubeKey);
+    .filter((item) =>
+      Number.isFinite(item.tmdbId) &&
+      item.youtubeKey &&
+      isCurrentTmdbTrailerRelease(item) &&
+      !looksAdultTmdbTrailerItem(item));
 }
 
 function sortTmdbTrailerCacheItems(items = []) {
@@ -2336,7 +2435,7 @@ async function fetchTmdbTrailerCachePayload(locale, { signal } = {}) {
   const response = await fetch(url.toString(), {
     method: "GET",
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: buildTmdbTrailerFetchHeaders(),
     signal
   });
   const rawText = await response.text().catch(() => "");
@@ -2362,6 +2461,8 @@ function buildTmdbTrailerRowItemFromCache(result) {
   const watchUrl = `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeKey)}`;
   const releaseLabel = getTmdbTrailerReleaseLabel(state);
   const videoName = String(result?.videoName || title).trim() || title;
+  const ratingScore = Number(result?.ratingScore);
+  const ratingSubScore = Number(result?.ratingSubScore);
 
   return {
     Id: `tmdb-trailer-${tmdbId}`,
@@ -2373,7 +2474,7 @@ function buildTmdbTrailerRowItemFromCache(result) {
     Overview: String(result?.overview || "").trim(),
     CommunityRating: null,
     Genres: [],
-    OfficialRating: "",
+    OfficialRating: String(result?.officialRating || "").trim(),
     UserData: {
       IsFavorite: false,
       PlaybackPositionTicks: 0
@@ -2382,11 +2483,15 @@ function buildTmdbTrailerRowItemFromCache(result) {
       Name: videoName,
       Url: watchUrl
     }],
-    __jmsVirtualTrailer: true,
+    __monwuiVirtualTrailer: true,
     __tmdbId: tmdbId,
     __tmdbTrailerState: state,
     __tmdbReleaseLabel: releaseLabel,
     __tmdbReleaseDateLabel: formatTmdbReleaseDateLabel(releaseDate),
+    __tmdbOriginalLanguage: String(result?.originalLanguage || "").trim(),
+    __tmdbRatingScore: Number.isFinite(ratingScore) ? ratingScore : null,
+    __tmdbRatingSubScore: Number.isFinite(ratingSubScore) ? ratingSubScore : null,
+    __tmdbCertificationCountry: String(result?.certificationCountry || "").trim(),
     __posterExternalUrl: String(result?.posterUrl || "").trim(),
     __backdropExternalUrl: String(result?.backdropUrl || "").trim(),
     __youtubeWatchUrl: watchUrl,
@@ -2397,21 +2502,16 @@ function buildTmdbTrailerRowItemFromCache(result) {
 
 async function fetchTmdbTrailerShowcase(limit = TOP10_ROW_CARD_COUNT, { signal } = {}) {
   const locale = resolveTmdbRowLocale();
-  const cached = readTmdbTrailerRowCache(locale.cacheKey);
-  if (cached.fresh && cached.items.length) {
-    return {
-      items: getTmdbTrailerRowSelection(locale.cacheKey, cached.items, limit),
-      reason: "cache"
-    };
-  }
+  const runtimeCacheKey = buildTmdbTrailerRowCacheKey(locale);
+  const cached = readTmdbTrailerRowCache(runtimeCacheKey);
 
   try {
     const payload = await fetchTmdbTrailerCachePayload(locale, { signal });
     const pool = sortTmdbTrailerCacheItems(normalizeTmdbTrailerCacheItems(payload));
-    const items = getTmdbTrailerRowSelection(locale.cacheKey, pool, limit);
+    const items = getTmdbTrailerRowSelection(runtimeCacheKey, pool, limit);
 
     if (items.length) {
-      writeTmdbTrailerRowCache(locale.cacheKey, pool);
+      writeTmdbTrailerRowCache(runtimeCacheKey, pool);
       return {
         items,
         reason: "ok"
@@ -2420,7 +2520,7 @@ async function fetchTmdbTrailerShowcase(limit = TOP10_ROW_CARD_COUNT, { signal }
 
     if (cached.items.length) {
       return {
-        items: getTmdbTrailerRowSelection(locale.cacheKey, cached.items, limit),
+        items: getTmdbTrailerRowSelection(runtimeCacheKey, cached.items, limit),
         reason: "staleCache"
       };
     }
@@ -2432,7 +2532,7 @@ async function fetchTmdbTrailerShowcase(limit = TOP10_ROW_CARD_COUNT, { signal }
   } catch (error) {
     console.warn("recentRows: tmdb trailer cache fetch error:", error);
     return {
-      items: getTmdbTrailerRowSelection(locale.cacheKey, cached.items, limit),
+      items: getTmdbTrailerRowSelection(runtimeCacheKey, cached.items, limit),
       reason: cached.items.length ? "staleCache" : "fetchError"
     };
   }
@@ -2588,7 +2688,7 @@ function createRecommendationCard(item, serverId, {
   const { itemId, itemName } = primeItemIdentity(item);
   const card = document.createElement("div");
   card.className = "card personal-recs-card";
-  const isTrailerVariant = variant === "tmdbTrailer" || item?.__jmsVirtualTrailer === true;
+  const isTrailerVariant = variant === "tmdbTrailer" || item?.__monwuiVirtualTrailer === true;
   const isTop10 = variant === "top10" || isTrailerVariant;
   if (isTop10) card.classList.add("top10-card");
   if (isTrailerVariant) card.classList.add("tmdb-trailer-card");
@@ -3619,37 +3719,17 @@ function buildSectionSkeleton({ titleText, badgeType, onSeeAll }) {
   try { scrollWrap.style.position = "relative"; } catch {}
   scrollWrap.classList.add("rr-scroll-pending");
 
-  const btnL = document.createElement("button");
-  btnL.className = "hub-scroll-btn hub-scroll-left";
-  btnL.setAttribute("aria-label", config.languageLabels.scrollLeft || "Sola kaydır");
-  btnL.setAttribute("aria-disabled", "true");
-  btnL.disabled = true;
-  btnL.style.visibility = "hidden";
-  btnL.style.pointerEvents = "none";
-  btnL.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>`;
-
   const row = document.createElement("div");
   row.className = "itemsContainer personal-recs-row";
   row.setAttribute("role", "list");
 
-  const btnR = document.createElement("button");
-  btnR.className = "hub-scroll-btn hub-scroll-right";
-  btnR.setAttribute("aria-label", config.languageLabels.scrollRight || "Sağa kaydır");
-  btnR.setAttribute("aria-disabled", "true");
-  btnR.disabled = true;
-  btnR.style.visibility = "hidden";
-  btnR.style.pointerEvents = "none";
-  btnR.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>`;
-
-  scrollWrap.appendChild(btnL);
   scrollWrap.appendChild(row);
-  scrollWrap.appendChild(btnR);
 
   section.appendChild(title);
   section.appendChild(heroHost);
   section.appendChild(scrollWrap);
 
-  return { section, row, heroHost, scrollWrap, btnL, btnR };
+  return { section, row, heroHost, scrollWrap };
 }
 
 function getBadgeText(type) {
@@ -3793,7 +3873,7 @@ async function fillSectionWithItems({
   emptyMessage = "",
   deferNetworkRender = false,
 }) {
-  const { section, row, heroHost, scrollWrap, btnL, btnR } = buildSectionSkeleton({
+  const { section, row, heroHost, scrollWrap } = buildSectionSkeleton({
     titleText,
     badgeType,
     onSeeAll
@@ -3841,10 +3921,6 @@ async function fillSectionWithItems({
   const finalizeScroller = () => {
     setupScroller(row);
     try { scrollWrap?.classList?.remove("rr-scroll-pending"); } catch {}
-    try {
-      if (btnL) { btnL.style.visibility = ""; btnL.style.pointerEvents = ""; btnL.disabled = false; }
-      if (btnR) { btnR.style.visibility = ""; btnR.style.pointerEvents = ""; btnR.disabled = false; }
-    } catch {}
   };
 
   const renderEmptyState = (message) => {
@@ -4345,9 +4421,6 @@ export async function mountRecentRowsLazy(options = {}) {
       setManagedRecentRowsDone(key, false);
     }
 
-    // Queue every managed recent-row section up front so the global managed
-    // render queue can see the full dependency chain before lower-priority
-    // modules like directorRows are allowed to advance.
     const scheduledSectionRuns = sectionKeys.map((sectionKey) => {
       recentRowsTrace("mount:section:start", {
         sectionKey,
@@ -4637,9 +4710,10 @@ async function initAndRender({ sectionKey = "recentRows", mountState = null } = 
         {
           cachedItems: () => {
             const locale = resolveTmdbRowLocale();
-            const cached = readTmdbTrailerRowCache(locale.cacheKey);
+            const runtimeCacheKey = buildTmdbTrailerRowCacheKey(locale);
+            const cached = readTmdbTrailerRowCache(runtimeCacheKey);
             const items = getTmdbTrailerRowSelection(
-              locale.cacheKey,
+              runtimeCacheKey,
               Array.isArray(cached?.items) ? cached.items : [],
               TOP10_ROW_CARD_COUNT
             );

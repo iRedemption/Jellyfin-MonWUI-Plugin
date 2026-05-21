@@ -17,12 +17,14 @@ const OVERLAY_ID = "jfProfileChooserOverlay";
 const HEADER_BTN_ID = "jfProfileChooserBtn";
 const TOKEN_STORE_PREFIX = "jf_profile_tokens_v1::";
 const TOKEN_STORE_REV_KEY = "jf_profile_tokens_rev::";
+const TOKEN_AUTO_SUPPRESS_PREFIX = "jf_profile_tokens_auto_suppressed::";
 const AUTOOPEN_FLAG = "jf_profileChooser_autoopened";
 const LAST_PICK_KEY = "jf_profileChooser_lastUser";
 const LAST_ACTIVE_KEY_PREFIX = "jf_profileChooser_lastActive::";
 const AUTOOPEN_INACTIVITY_MS = 6 * 60 * 60 * 1000;
 const CUSTOM_SPLASH_ACTIVE_ATTR = "data-jms-custom-splash";
 const CUSTOM_SPLASH_HIDDEN_ATTR = "data-jms-custom-splash-hidden";
+const ADMIN_RETURN_USER_ID = "__jfpc_admin_return__";
 
 let headerHideMo = null;
 
@@ -193,6 +195,10 @@ function tokenStoreRevKey() {
   return TOKEN_STORE_REV_KEY + getServerIdentity();
 }
 
+function tokenAutoSuppressKey() {
+  return TOKEN_AUTO_SUPPRESS_PREFIX + getServerIdentity();
+}
+
 function lastActiveKey() {
   return LAST_ACTIVE_KEY_PREFIX + getServerIdentity();
 }
@@ -238,17 +244,84 @@ function writeTokenStore(obj) {
   bumpTokenStoreRev();
 }
 
+function hashTokenValue(value) {
+  const s = String(value || "");
+  if (!s) return "";
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function readAutoSuppressStore() {
+  try {
+    const raw = localStorage.getItem(tokenAutoSuppressKey());
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeAutoSuppressStore(obj) {
+  try { localStorage.setItem(tokenAutoSuppressKey(), JSON.stringify(obj || {})); } catch {}
+  bumpTokenStoreRev();
+}
+
+function suppressAutoRememberForToken(userId, accessToken) {
+  const id = String(userId || "").trim();
+  const tokenHash = hashTokenValue(accessToken);
+  if (!id || !tokenHash) return false;
+
+  const store = readAutoSuppressStore();
+  store[id] = { tokenHash, ts: Date.now() };
+  writeAutoSuppressStore(store);
+  return true;
+}
+
+function clearAutoRememberSuppression(userId) {
+  const id = String(userId || "").trim();
+  if (!id) return false;
+
+  try {
+    const store = readAutoSuppressStore();
+    if (!store || !store[id]) return false;
+    delete store[id];
+    writeAutoSuppressStore(store);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isAutoRememberSuppressed(userId, accessToken) {
+  const id = String(userId || "").trim();
+  const tokenHash = hashTokenValue(accessToken);
+  if (!id || !tokenHash) return false;
+
+  try {
+    const rec = readAutoSuppressStore()?.[id] || null;
+    return !!rec && String(rec.tokenHash || "") === tokenHash;
+  } catch {
+    return false;
+  }
+}
+
 function rememberUserToken(tokenInfo = {}) {
-  const { userId, name, accessToken, primaryImageTag } = tokenInfo;
+  const { userId, name, accessToken, primaryImageTag, isAdmin } = tokenInfo;
   if (!userId || !accessToken) return;
+  clearAutoRememberSuppression(userId);
   const store = readTokenStore();
   const hasPrimaryImageTag = Object.prototype.hasOwnProperty.call(tokenInfo, "primaryImageTag");
+  const hasIsAdmin = Object.prototype.hasOwnProperty.call(tokenInfo, "isAdmin");
   store[userId] = {
     accessToken,
     name: name || store[userId]?.name || "",
     primaryImageTag: hasPrimaryImageTag
       ? getUserPrimaryImageTag({ PrimaryImageTag: primaryImageTag })
       : (store[userId]?.primaryImageTag || ""),
+    isAdmin: hasIsAdmin ? readBooleanish(isAdmin) === true : store[userId]?.isAdmin === true,
     ts: Date.now(),
   };
   writeTokenStore(store);
@@ -274,6 +347,7 @@ function forgetRememberedToken(userId) {
   try {
     const store = readTokenStore();
     if (store && store[userId]) {
+      suppressAutoRememberForToken(userId, store[userId]?.accessToken || "");
       delete store[userId];
       writeTokenStore(store);
       return true;
@@ -508,6 +582,110 @@ async function fetchUserByIdAuthed(userId, { signal } = {}) {
   return await res.json().catch(() => null);
 }
 
+async function buildCurrentSessionTokenSnapshot({ fallbackAdmin = null } = {}) {
+  const snapshot = {
+    userId: "",
+    name: "",
+    accessToken: "",
+    primaryImageTag: "",
+    isAdmin: readBooleanish(fallbackAdmin),
+  };
+
+  try {
+    const si = getSessionInfo?.() || {};
+    snapshot.userId = String(si.userId || si.UserId || snapshot.userId || "").trim();
+    snapshot.name = String(si.UserName || si.userName || snapshot.name || "").trim();
+    snapshot.accessToken = String(si.accessToken || si.AccessToken || snapshot.accessToken || "").trim();
+    mergeUserSnapshot(snapshot, si.User || si.user);
+    mergeUserSnapshot(snapshot, si);
+  } catch {}
+
+  try {
+    const ac = window.ApiClient || window.apiClient || null;
+    if (ac) {
+      const token =
+        (typeof ac.accessToken === "function" ? ac.accessToken() : "") ||
+        ac._accessToken ||
+        "";
+      if (token && !snapshot.accessToken) snapshot.accessToken = String(token).trim();
+      mergeUserSnapshot(snapshot, ac._currentUser);
+
+      if (typeof ac.getCurrentUser === "function") {
+        const currentUser = await ac.getCurrentUser().catch(() => null);
+        mergeUserSnapshot(snapshot, currentUser);
+      }
+    }
+  } catch {}
+
+  if (!snapshot.accessToken) {
+    try {
+      snapshot.accessToken = String(
+        localStorage.getItem("accessToken") ||
+        sessionStorage.getItem("accessToken") ||
+        localStorage.getItem("embyToken") ||
+        sessionStorage.getItem("embyToken") ||
+        ""
+      ).trim();
+    } catch {}
+  }
+
+  if (!snapshot.userId) {
+    try {
+      snapshot.userId = String(
+        localStorage.getItem("userId") ||
+        sessionStorage.getItem("userId") ||
+        ""
+      ).trim();
+    } catch {}
+  }
+
+  try {
+    if (snapshot.userId && (!snapshot.primaryImageTag || snapshot.isAdmin === null)) {
+      const fetched = await fetchUserByIdAuthed(snapshot.userId).catch(() => null);
+      mergeUserSnapshot(snapshot, fetched);
+    }
+  } catch {}
+
+  if (snapshot.isAdmin === null) snapshot.isAdmin = false;
+  return snapshot;
+}
+
+function findRememberedAdminQuickLogin(excludeUserId = "") {
+  try {
+    const currentId = String(excludeUserId || "").trim();
+    const store = readTokenStore();
+    const adminEntries = Object.entries(store || {})
+      .filter(([userId, rec]) => {
+        const id = String(userId || "").trim();
+        return !!id
+          && id !== currentId
+          && !!String(rec?.accessToken || "").trim()
+          && rec?.isAdmin === true;
+      })
+      .sort((a, b) => (Number(b?.[1]?.ts) || 0) - (Number(a?.[1]?.ts) || 0));
+
+    if (!adminEntries.length) return null;
+    const [userId, rec] = adminEntries[0];
+    return { userId, rec };
+  } catch {
+    return null;
+  }
+}
+
+function buildAdminReturnEntry(currentUserId, L) {
+  const adminToken = findRememberedAdminQuickLogin(currentUserId);
+  if (!adminToken?.userId) return null;
+
+  return {
+    Id: ADMIN_RETURN_USER_ID,
+    Name: L("profileChooserAdminReturn", "Return to admin"),
+    HasPassword: false,
+    PrimaryImageTag: "",
+    IsAdminReturn: true,
+    AdminUserId: adminToken.userId,
+  };
+}
+
 async function fetchSessionsAuthed({ signal } = {}) {
   try {
     const ac = window.ApiClient || window.apiClient || null;
@@ -559,6 +737,53 @@ function getUserPrimaryImageTag(user) {
     user?.imageTags?.Primary ??
     ""
   ).trim();
+}
+
+function readBooleanish(value) {
+  if (value === true || value === "true" || value === 1 || value === "1") return true;
+  if (value === false || value === "false" || value === 0 || value === "0") return false;
+  return null;
+}
+
+function readAdminFlagFromPolicy(policy) {
+  if (!policy || typeof policy !== "object") return null;
+  const candidates = [policy.IsAdministrator, policy.IsAdmin, policy.IsAdminUser];
+  for (const candidate of candidates) {
+    const normalized = readBooleanish(candidate);
+    if (normalized !== null) return normalized;
+  }
+  return null;
+}
+
+function readAdminFlagFromUser(user) {
+  if (!user || typeof user !== "object") return null;
+
+  const policyFlag = readAdminFlagFromPolicy(user.Policy || user.UserPolicy || user.policy);
+  if (policyFlag !== null) return policyFlag;
+
+  const candidates = [user.IsAdministrator, user.isAdministrator, user.IsAdmin, user.isAdmin];
+  for (const candidate of candidates) {
+    const normalized = readBooleanish(candidate);
+    if (normalized !== null) return normalized;
+  }
+
+  return null;
+}
+
+function mergeUserSnapshot(target, user) {
+  if (!target || !user || typeof user !== "object") return;
+
+  const id = String(user.Id || user.id || user.UserId || user.userId || "").trim();
+  const name = String(user.Name || user.name || user.UserName || user.userName || "").trim();
+  const token = String(user.AccessToken || user.accessToken || user.Token || user.token || "").trim();
+  const primaryImageTag = getUserPrimaryImageTag(user);
+  const isAdmin = readAdminFlagFromUser(user);
+
+  if (id && !target.userId) target.userId = id;
+  if (name && !target.name) target.name = name;
+  if (token && !target.accessToken) target.accessToken = token;
+  if (primaryImageTag && !target.primaryImageTag) target.primaryImageTag = primaryImageTag;
+  if (isAdmin !== null) target.isAdmin = isAdmin;
 }
 
 function userAvatarUrl({ Id, PrimaryImageTag }, size = 220) {
@@ -1116,6 +1341,7 @@ export function initProfileChooser(options = {}) {
   const autoOpen = options.autoOpen ?? (cfg.profileChooserAutoOpen !== false);
   const autoOpenRequireQuickLogin = cfg.profileChooserAutoOpenRequireQuickLogin !== false;
   const rememberTokens = cfg.profileChooserRememberTokens !== false;
+  const hideUsersFromRegularUsers = cfg.profileChooserHideUsersFromRegularUsers === true;
 
   let overlay = null;
   let cleanupHeader = null;
@@ -1126,6 +1352,8 @@ export function initProfileChooser(options = {}) {
   let currentList = [];
   let currentUserId = "";
   let currentUserName = "";
+  let currentPrimaryImageTag = "";
+  let currentUserIsAdmin = false;
   let refreshInFlight = null;
   const presenceByUserId = new Map();
   let overlayPresenceTimer = null;
@@ -1323,17 +1551,24 @@ export function initProfileChooser(options = {}) {
     refreshInFlight = (async () => {
       currentUserId = "";
       currentUserName = "";
+      currentPrimaryImageTag = "";
+      currentUserIsAdmin = false;
       try {
-        const si = getSessionInfo?.() || {};
-        currentUserId = String(si.userId || "").trim();
-        currentUserName = String(si?.UserName || si?.User?.Name || si?.userName || "").trim();
+        const snapshot = await buildCurrentSessionTokenSnapshot();
+        currentUserId = String(snapshot.userId || "").trim();
+        currentUserName = String(snapshot.name || "").trim();
+        currentPrimaryImageTag = String(snapshot.primaryImageTag || "").trim();
+        currentUserIsAdmin = snapshot.isAdmin === true;
       } catch {}
 
-      let users = await fetchPublicUsers().catch(() => []);
+      const shouldLoadSharedUsers = !hideUsersFromRegularUsers || currentUserIsAdmin;
+      let users = shouldLoadSharedUsers
+        ? await fetchPublicUsers().catch(() => [])
+        : [];
 
       try {
         const ready = (typeof isAuthReadyStrict === "function" ? isAuthReadyStrict() : false);
-        if (ready) {
+        if (ready && shouldLoadSharedUsers) {
           await waitForAuthReadyStrict?.(2000).catch(() => {});
           const more = await fetchAllUsersAuthed().catch(() => []);
           if (Array.isArray(more) && more.length) {
@@ -1364,6 +1599,7 @@ export function initProfileChooser(options = {}) {
           Name: String(u.Name || u.name),
           HasPassword: !!u.HasPassword,
           PrimaryImageTag: getUserPrimaryImageTag(u),
+          IsAdmin: readAdminFlagFromUser(u) === true,
         }));
 
       if (!currentList.length && currentUserId) {
@@ -1371,14 +1607,34 @@ export function initProfileChooser(options = {}) {
           Id: currentUserId,
           Name: currentUserName || L("profil", "Profil"),
           HasPassword: false,
-          PrimaryImageTag: "",
+          PrimaryImageTag: currentPrimaryImageTag,
+          IsAdmin: currentUserIsAdmin,
         }];
+      }
+
+      if (hideUsersFromRegularUsers && !currentUserIsAdmin) {
+        const currentEntry =
+          currentList.find(u => u.Id === currentUserId) ||
+          (currentUserId ? {
+            Id: currentUserId,
+            Name: currentUserName || L("profil", "Profil"),
+            HasPassword: false,
+            PrimaryImageTag: currentPrimaryImageTag,
+            IsAdmin: false,
+          } : null);
+
+        currentList = currentEntry ? [currentEntry] : [];
+
+        if (rememberTokens) {
+          const adminReturnEntry = buildAdminReturnEntry(currentUserId, L);
+          if (adminReturnEntry) currentList.push(adminReturnEntry);
+        }
       }
 
       presenceByUserId.clear();
       try {
         const ready = (typeof isAuthReadyStrict === "function" ? isAuthReadyStrict() : false);
-        if (ready) {
+        if (ready && shouldLoadSharedUsers) {
           const sessions = await fetchSessionsAuthed().catch(() => []);
           for (const s of (Array.isArray(sessions) ? sessions : [])) {
             const sid = String(s?.UserId || "").trim();
@@ -1416,11 +1672,20 @@ export function initProfileChooser(options = {}) {
       if (rememberTokens && currentUserId && currentUserName) {
         try {
           const store = readTokenStore();
-          const rev = readTokenStoreRev();
+          let changed = false;
           if (store[currentUserId] && !store[currentUserId].name) {
             store[currentUserId].name = currentUserName;
-            writeTokenStore(store);
+            changed = true;
           }
+          if (store[currentUserId] && currentPrimaryImageTag && !store[currentUserId].primaryImageTag) {
+            store[currentUserId].primaryImageTag = currentPrimaryImageTag;
+            changed = true;
+          }
+          if (store[currentUserId] && currentUserIsAdmin && store[currentUserId].isAdmin !== true) {
+            store[currentUserId].isAdmin = true;
+            changed = true;
+          }
+          if (changed) writeTokenStore(store);
         } catch {}
       }
 
@@ -1444,9 +1709,11 @@ export function initProfileChooser(options = {}) {
       const id = u.Id;
       const name = u.Name;
       usersById.set(String(id), u);
+      const isAdminReturn = !!u.IsAdminReturn;
       const isCurrent = currentUserId && id === currentUserId;
-      const remembered = !!store?.[id]?.accessToken;
-      const presence = presenceByUserId.get(id) || null;
+      const remembered = !isAdminReturn && !!store?.[id]?.accessToken;
+      const showQuickBadge = remembered || isAdminReturn;
+      const presence = isAdminReturn ? null : (presenceByUserId.get(id) || null);
       const isOnline = !!presence?.online;
       const isPlaying = !!presence?.isPlaying;
       const isPaused = !!presence?.isPaused;
@@ -1479,8 +1746,10 @@ export function initProfileChooser(options = {}) {
                 ${escapeHtml(L("cevrimici", "Çevrimiçi"))}
               </span>
             ` : ``}
-            ${remembered ? `
+            ${showQuickBadge ? `
               <span class="jf-profile-badge jfpc-chip">${escapeHtml(L("hizli", "Hızlı"))}</span>
+            ` : ``}
+            ${remembered ? `
               <span
                 class="jf-profile-forget jfpc-chip"
                 role="button"
@@ -1572,11 +1841,67 @@ export function initProfileChooser(options = {}) {
     }
   }
 
+  async function rememberCurrentAdminToken() {
+    if (!rememberTokens) return false;
+
+    const snapshot = await buildCurrentSessionTokenSnapshot({
+      fallbackAdmin: currentUserIsAdmin,
+    }).catch(() => null);
+
+    if (!snapshot?.userId || !snapshot?.accessToken || snapshot.isAdmin !== true) {
+      return false;
+    }
+
+    if (isAutoRememberSuppressed(snapshot.userId, snapshot.accessToken)) {
+      return false;
+    }
+
+    rememberUserToken(snapshot);
+    return true;
+  }
+
+  async function switchWithRememberedToken(user, remembered, { targetUserId = "", forceAdmin = false } = {}) {
+    const resolvedUserId = String(targetUserId || user?.Id || "").trim();
+    if (!resolvedUserId || !remembered?.accessToken) return false;
+
+    try { overlay?.classList.add("busy"); } catch {}
+    try {
+      await rememberCurrentAdminToken().catch(() => {});
+
+      applyAuthToJellyfinCredentials({
+        userId: resolvedUserId,
+        userName: remembered.name || user?.Name || "",
+        accessToken: remembered.accessToken,
+      });
+
+      try {
+        const u = await fetchUserByIdAuthed(resolvedUserId).catch(() => null);
+        const fetchedAdmin = readAdminFlagFromUser(u);
+        rememberUserToken({
+          userId: resolvedUserId,
+          name: String(u?.Name || remembered.name || user?.Name || "").trim(),
+          accessToken: remembered.accessToken,
+          primaryImageTag: getUserPrimaryImageTag(u) || remembered.primaryImageTag || "",
+          isAdmin: forceAdmin || fetchedAdmin === true || (fetchedAdmin === null && remembered.isAdmin === true),
+        });
+      } catch {}
+
+      try { localStorage.setItem(LAST_PICK_KEY, resolvedUserId); } catch {}
+      close();
+      try { location.reload(); } catch {}
+      return true;
+    } finally {
+      try { overlay?.classList.remove("busy"); } catch {}
+    }
+  }
+
   async function loginAndSwitch(user, password) {
     if (!user?.Name) return;
 
     try { overlay?.classList.add("busy"); } catch {}
     try {
+      await rememberCurrentAdminToken().catch(() => {});
+
       const resp = await authenticateByName(user.Name, password);
 
       const accessToken = resp?.AccessToken || resp?.accessToken || resp?.Token || "";
@@ -1584,11 +1909,12 @@ export function initProfileChooser(options = {}) {
       const userId = String(u?.Id || user.Id || "").trim();
       const userName = String(u?.Name || user.Name || "").trim();
       const primaryImageTag = getUserPrimaryImageTag(u);
+      const isAdmin = readAdminFlagFromUser(u) === true;
 
       if (!accessToken || !userId) throw new Error(L("loginEksikYanıt", "Login yanıtı eksik (token/userId)"));
 
       if (rememberTokens) {
-        rememberUserToken({ userId, name: userName, accessToken, primaryImageTag });
+        rememberUserToken({ userId, name: userName, accessToken, primaryImageTag, isAdmin });
       }
 
       applyAuthToJellyfinCredentials({ userId, userName, accessToken });
@@ -1613,6 +1939,18 @@ export function initProfileChooser(options = {}) {
     const user = currentList.find(u => u.Id === userId) || null;
     if (!user) return;
 
+    if (user.IsAdminReturn) {
+      const adminUserId = String(user.AdminUserId || "").trim();
+      const rememberedAdmin = getRememberedToken(adminUserId);
+      if (rememberedAdmin?.accessToken) {
+        await switchWithRememberedToken(user, rememberedAdmin, {
+          targetUserId: adminUserId,
+          forceAdmin: true,
+        });
+      }
+      return;
+    }
+
     if (currentUserId && user.Id === currentUserId) {
       try { localStorage.setItem(LAST_PICK_KEY, user.Id); } catch {}
       close();
@@ -1621,28 +1959,7 @@ export function initProfileChooser(options = {}) {
 
     const remembered = getRememberedToken(user.Id);
     if (remembered?.accessToken) {
-      applyAuthToJellyfinCredentials({
-        userId: user.Id,
-        userName: remembered.name || user.Name,
-        accessToken: remembered.accessToken,
-      });
-
-      try {
-        const u = await fetchUserByIdAuthed(user.Id).catch(() => null);
-        if (u) {
-          const newTag = getUserPrimaryImageTag(u);
-          rememberUserToken({
-            userId: user.Id,
-            name: remembered.name || user.Name,
-            accessToken: remembered.accessToken,
-            primaryImageTag: newTag,
-          });
-        }
-      } catch {}
-
-      try { localStorage.setItem(LAST_PICK_KEY, user.Id); } catch {}
-      close();
-      try { location.reload(); } catch {}
+      await switchWithRememberedToken(user, remembered);
       return;
     }
 

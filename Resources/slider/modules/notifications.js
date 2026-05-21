@@ -7,6 +7,7 @@ import { withServer } from "./jfUrl.js";
 import { faIconHtml } from "./faIcons.js";
 import { openDetailsModal } from "./detailsModalLoader.js";
 import { applyHeaderIconButtonMode, findHeaderMountTarget } from "./headerCompat.js";
+import { ensureSerrNotificationsTab, getCachedSerrNotificationCount, markSerrNotificationsSeen, refreshSerrNotifications, renderSerrNotifications, scheduleSerrNotificationsPoll, stopSerrNotificationsPoll } from "./seerr/notificationsPanel.js";
 
 const config = getConfig();
 let __castModulePromise = null;
@@ -28,6 +29,20 @@ function getLiveConfig() {
   } catch {
     return config || {};
   }
+}
+
+function isSerrArrIntegrationEnabled() {
+  return getLiveConfig()?.enableSerrArrIntegrationModule !== false;
+}
+
+export function syncSerrNotificationsIntegration() {
+  if (isSerrArrIntegrationEnabled()) {
+    ensureSerrNotificationsTab({ bindNotifTabButton });
+    scheduleSerrNotificationsPoll();
+  } else {
+    stopSerrNotificationsPoll();
+  }
+  updateBadge();
 }
 
 function getLiveLabels() {
@@ -732,6 +747,7 @@ function ensureUI() {
   document.querySelectorAll(".jf-notif-tab").forEach(bindNotifTabButton);
   __uiReady = true;
 ensureSystemTabPresence();
+ syncSerrNotificationsIntegration();
  void ensureCastTabPresence();
  }
 
@@ -755,6 +771,13 @@ function activateNotifTab(tabName = "new") {
     void mountCastTabPanel();
   } else {
     cleanupCastTabMount();
+  }
+
+  if (tabName === "serr") {
+    if (isSerrArrIntegrationEnabled()) {
+      markSerrNotificationsSeen();
+      void refreshSerrNotifications({ render: true }).then(() => markSerrNotificationsSeen());
+    }
   }
 }
 
@@ -1063,6 +1086,17 @@ function openModal() {
   requestAnimationFrame(() => m.classList.add("open"));
   notifState.isModalOpen = true;
   renderNotifications();
+  if (isSerrArrIntegrationEnabled()) {
+    ensureSerrNotificationsTab({ bindNotifTabButton });
+    renderSerrNotifications();
+    const serrTabActive = document.querySelector('#jfNotifModal .jf-notif-tab.active[data-tab="serr"]') != null;
+    if (serrTabActive) markSerrNotificationsSeen();
+    void refreshSerrNotifications({ render: true }).then(() => {
+      if (serrTabActive) markSerrNotificationsSeen();
+    });
+  } else {
+    stopSerrNotificationsPoll();
+  }
   void ensureCastTabPresence();
   if (liveConfig.enableRenderResume !== false) renderResume();
   if (notifState._systemAllowed) {
@@ -1107,6 +1141,7 @@ function updateBadge() {
   if (!badges.length && !btns.length) return;
 
   const contentUnread = notifState.list.reduce((acc, n) => acc + (n.read ? 0 : 1), 0);
+  const serrUnread = isSerrArrIntegrationEnabled() ? getCachedSerrNotificationCount() : 0;
   const lastSeenAct = Number(notifState.activityLastSeen || 0);
   const sysEnabled = isSystemCounterEnabled();
   const systemUnread = (notifState._systemAllowed && sysEnabled && Array.isArray(notifState.activities))
@@ -1116,7 +1151,7 @@ function updateBadge() {
       }, 0)
     : 0;
 
-  const total = contentUnread + systemUnread;
+  const total = contentUnread + systemUnread + serrUnread;
   const label = total > 99 ? "99+" : String(total);
   const show = total > 0;
 
@@ -1745,6 +1780,8 @@ export async function initNotifications() {
   loadState();
   ensureUI();
   ensureSystemTabPresence();
+  syncSerrNotificationsIntegration();
+  window.addEventListener("monwui:serr-notification-count-changed", updateBadge);
 
   setTimeout(() => {
     const host = findHeaderContainer();

@@ -130,7 +130,6 @@ namespace Jellyfin.Plugin.JMSFusion
   }
 
   function canReachPluginPresenceSync() {
-    // Fail closed when cached bootstrap code survives after the plugin is gone.
     for (var i = 0; i < PING_PATHS.length; i += 1) {
       try {
         var xhr = new XMLHttpRequest();

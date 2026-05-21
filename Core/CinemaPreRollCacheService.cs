@@ -2,6 +2,11 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Jellyfin.Data.Enums;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Globalization;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.JMSFusion.Core;
@@ -11,11 +16,17 @@ public sealed class CinemaPreRollCacheService
     private const string CacheFileName = "tmdb-cinema-preroll-cache.json";
     private const string TmdbApiBase = "https://api.themoviedb.org/3";
     private const string TmdbImageBase = "https://image.tmdb.org/t/p/original";
-    private const int CacheVersion = 3;
+    private const int CacheVersion = 5;
+    private const long LibraryTmdbCacheTtlMs = 5 * 60 * 1000;
     private const int MaxItemsPerLocale = 150;
     private const int MaxPagesPerFeed = 8;
     private const int MaxSeedCandidates = MaxItemsPerLocale * 4;
     private const int MaxConcurrentTmdbRequests = 8;
+    private const int RecentReleasePastWindowDays = 70;
+    private const int UpcomingReleaseFutureWindowDays = 365;
+    private const string EnglishFallbackLanguage = "en-US";
+    private const string EnglishFallbackRegion = "US";
+    private const string EnglishFallbackOriginalLanguage = "en";
     private static readonly string[] AdultContentMarkers =
     {
         "porn",
@@ -44,11 +55,20 @@ public sealed class CinemaPreRollCacheService
     };
 
     private readonly ILogger<CinemaPreRollCacheService> _logger;
+    private readonly ILocalizationManager _localization;
+    private readonly ILibraryManager _libraryManager;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private HashSet<int>? _libraryMovieTmdbIdsCache;
+    private long _libraryMovieTmdbIdsCacheAtUtc;
 
-    public CinemaPreRollCacheService(ILogger<CinemaPreRollCacheService> logger)
+    public CinemaPreRollCacheService(
+        ILogger<CinemaPreRollCacheService> logger,
+        ILocalizationManager localization,
+        ILibraryManager libraryManager)
     {
         _logger = logger;
+        _localization = localization;
+        _libraryManager = libraryManager;
     }
 
     public sealed class CacheSnapshot
@@ -74,6 +94,11 @@ public sealed class CinemaPreRollCacheService
         public string BackdropUrl { get; set; } = string.Empty;
         public string PosterUrl { get; set; } = string.Empty;
         public string SourceList { get; set; } = string.Empty;
+        public string OriginalLanguage { get; set; } = string.Empty;
+        public string OfficialRating { get; set; } = string.Empty;
+        public int? RatingScore { get; set; }
+        public int? RatingSubScore { get; set; }
+        public string CertificationCountry { get; set; } = string.Empty;
         public bool Adult { get; set; }
     }
 
@@ -83,6 +108,7 @@ public sealed class CinemaPreRollCacheService
         public required string Region { get; init; }
         public required string CacheKey { get; init; }
         public required string IncludeVideoLanguage { get; init; }
+        public string? RequiredOriginalLanguage { get; init; }
     }
 
     private sealed class CacheFileModel
@@ -128,7 +154,33 @@ public sealed class CinemaPreRollCacheService
         [JsonPropertyName("poster_path")]
         public string? PosterPath { get; set; }
 
+        [JsonPropertyName("original_language")]
+        public string? OriginalLanguage { get; set; }
+
         public bool Adult { get; set; }
+    }
+
+    private sealed class TmdbReleaseDatesResponse
+    {
+        public List<TmdbReleaseCountry>? Results { get; set; }
+    }
+
+    private sealed class TmdbReleaseCountry
+    {
+        [JsonPropertyName("iso_3166_1")]
+        public string? CountryCode { get; set; }
+
+        [JsonPropertyName("release_dates")]
+        public List<TmdbReleaseDate>? ReleaseDates { get; set; }
+    }
+
+    private sealed class TmdbReleaseDate
+    {
+        public string? Certification { get; set; }
+        public int Type { get; set; }
+
+        [JsonPropertyName("release_date")]
+        public string? ReleaseDate { get; set; }
     }
 
     private sealed class TmdbVideosResponse
@@ -158,8 +210,16 @@ public sealed class CinemaPreRollCacheService
         public string BackdropUrl { get; set; } = string.Empty;
         public string PosterUrl { get; set; } = string.Empty;
         public string SourceList { get; set; } = string.Empty;
+        public string OriginalLanguage { get; set; } = string.Empty;
+        public string FeedRegion { get; set; } = string.Empty;
         public bool Adult { get; set; }
     }
+
+    private sealed record CertificationInfo(
+        string OfficialRating,
+        int? RatingScore,
+        int? RatingSubScore,
+        string CertificationCountry);
 
     private sealed class ScoredVideo
     {
@@ -254,19 +314,23 @@ public sealed class CinemaPreRollCacheService
             return null;
         }
 
+        var libraryTmdbIds = GetLibraryMovieTmdbIdSetCached();
         var seeds = await FetchMovieSeedsAsync(apiKey, locale, ct).ConfigureAwait(false);
+        seeds = ExcludeLibraryMovieSeeds(seeds, libraryTmdbIds);
         if (seeds.Count == 0)
         {
-            return BuildLocaleSnapshot(locale, NormalizeCacheItems(existingSnapshot?.Items));
+            return BuildLocaleSnapshot(locale, ExcludeLibraryMovies(NormalizeCacheItems(existingSnapshot?.Items), libraryTmdbIds));
         }
 
         var refreshedItems = await ResolveTrailerItemsAsync(apiKey, locale, seeds, ct).ConfigureAwait(false);
+        refreshedItems = ExcludeLibraryMovies(refreshedItems, libraryTmdbIds);
         if (refreshedItems.Count == 0 && existingSnapshot?.Items?.Count > 0)
         {
-            return BuildLocaleSnapshot(locale, NormalizeCacheItems(existingSnapshot.Items));
+            return BuildLocaleSnapshot(locale, ExcludeLibraryMovies(NormalizeCacheItems(existingSnapshot.Items), libraryTmdbIds));
         }
 
         var mergedItems = MergeRefreshedItemsWithExisting(existingSnapshot?.Items, refreshedItems);
+        mergedItems = ExcludeLibraryMovies(mergedItems, libraryTmdbIds);
         return BuildLocaleSnapshot(locale, mergedItems);
     }
 
@@ -291,18 +355,19 @@ public sealed class CinemaPreRollCacheService
             FetchFeedAsync(apiKey, "/movie/upcoming", "upcoming", locale, ct)
         };
 
-        if (!string.IsNullOrWhiteSpace(locale.Region))
+        if (!IsEnglishFallbackLocale(locale))
         {
-            var globalLocale = new LocaleRequest
+            var englishFallbackLocale = new LocaleRequest
             {
-                Language = locale.Language,
-                Region = string.Empty,
-                CacheKey = $"{locale.Language}:GLOBAL",
-                IncludeVideoLanguage = locale.IncludeVideoLanguage
+                Language = EnglishFallbackLanguage,
+                Region = EnglishFallbackRegion,
+                CacheKey = $"{locale.Language}:ENGLISH-FALLBACK",
+                IncludeVideoLanguage = "en,null",
+                RequiredOriginalLanguage = EnglishFallbackOriginalLanguage
             };
 
-            tasks.Add(FetchFeedAsync(apiKey, "/movie/now_playing", "now_playing_global", globalLocale, ct));
-            tasks.Add(FetchFeedAsync(apiKey, "/movie/upcoming", "upcoming_global", globalLocale, ct));
+            tasks.Add(FetchFeedAsync(apiKey, "/movie/now_playing", "now_playing_english", englishFallbackLocale, ct));
+            tasks.Add(FetchFeedAsync(apiKey, "/movie/upcoming", "upcoming_english", englishFallbackLocale, ct));
         }
 
         await Task.WhenAll(tasks).ConfigureAwait(false);
@@ -314,7 +379,8 @@ public sealed class CinemaPreRollCacheService
         }
 
         return merged.Values
-            .OrderByDescending(seed => ParseReleaseDate(seed.ReleaseDate))
+            .OrderByDescending(seed => ScoreSourceList(seed.SourceList))
+            .ThenByDescending(seed => ParseReleaseDate(seed.ReleaseDate))
             .ThenByDescending(seed => seed.TmdbId)
             .Take(MaxSeedCandidates)
             .ToList();
@@ -355,6 +421,8 @@ public sealed class CinemaPreRollCacheService
             .Where(movie =>
                 movie.Id > 0 &&
                 !movie.Adult &&
+                IsCurrentTrailerRelease(movie.ReleaseDate) &&
+                MatchesRequiredOriginalLanguage(movie, locale.RequiredOriginalLanguage) &&
                 !LooksAdultContent(movie.Title, movie.OriginalTitle, movie.Overview))
             .Select(movie => new MovieSeed
             {
@@ -365,6 +433,8 @@ public sealed class CinemaPreRollCacheService
                 BackdropUrl = string.IsNullOrWhiteSpace(movie.BackdropPath) ? string.Empty : $"{TmdbImageBase}{movie.BackdropPath}",
                 PosterUrl = string.IsNullOrWhiteSpace(movie.PosterPath) ? string.Empty : $"{TmdbImageBase}{movie.PosterPath}",
                 SourceList = sourceList,
+                OriginalLanguage = TrimOrEmpty(movie.OriginalLanguage).ToLowerInvariant(),
+                FeedRegion = locale.Region,
                 Adult = movie.Adult
             })
             .ToList();
@@ -414,6 +484,14 @@ public sealed class CinemaPreRollCacheService
                     return;
                 }
 
+                var libraryTmdbIds = GetLibraryMovieTmdbIdSetCached();
+                if (IsMovieInJellyfinLibrary(seed.TmdbId, libraryTmdbIds))
+                {
+                    return;
+                }
+
+                var certification = await FetchCertificationInfoAsync(apiKey, locale, seed, ct).ConfigureAwait(false);
+
                 items.Add(new CacheItem
                 {
                     TmdbId = seed.TmdbId,
@@ -425,6 +503,11 @@ public sealed class CinemaPreRollCacheService
                     BackdropUrl = seed.BackdropUrl,
                     PosterUrl = seed.PosterUrl,
                     SourceList = seed.SourceList,
+                    OriginalLanguage = seed.OriginalLanguage,
+                    OfficialRating = certification?.OfficialRating ?? string.Empty,
+                    RatingScore = certification?.RatingScore,
+                    RatingSubScore = certification?.RatingSubScore,
+                    CertificationCountry = certification?.CertificationCountry ?? string.Empty,
                     Adult = seed.Adult
                 });
             }
@@ -442,7 +525,8 @@ public sealed class CinemaPreRollCacheService
                 .OrderByDescending(item => ScoreSourceList(item.SourceList))
                 .ThenByDescending(item => ParseReleaseDate(item.ReleaseDate))
                 .First())
-            .OrderByDescending(item => ParseReleaseDate(item.ReleaseDate))
+            .OrderByDescending(item => ScoreSourceList(item.SourceList))
+            .ThenByDescending(item => ParseReleaseDate(item.ReleaseDate))
             .ThenByDescending(item => item.TmdbId)
             .Take(MaxItemsPerLocale)
             .ToList();
@@ -494,6 +578,7 @@ public sealed class CinemaPreRollCacheService
                 item.TmdbId <= 0 ||
                 item.Adult ||
                 string.IsNullOrWhiteSpace(item.YoutubeKey) ||
+                !IsCurrentTrailerRelease(item.ReleaseDate) ||
                 LooksAdultContent(item.Title, item.VideoName, item.Overview))
             {
                 continue;
@@ -527,6 +612,11 @@ public sealed class CinemaPreRollCacheService
             BackdropUrl = TrimOrEmpty(item.BackdropUrl),
             PosterUrl = TrimOrEmpty(item.PosterUrl),
             SourceList = TrimOrEmpty(item.SourceList),
+            OriginalLanguage = TrimOrEmpty(item.OriginalLanguage).ToLowerInvariant(),
+            OfficialRating = TrimOrEmpty(item.OfficialRating),
+            RatingScore = item.RatingScore,
+            RatingSubScore = item.RatingSubScore,
+            CertificationCountry = TrimOrEmpty(item.CertificationCountry).ToUpperInvariant(),
             Adult = item.Adult
         };
     }
@@ -544,6 +634,11 @@ public sealed class CinemaPreRollCacheService
             BackdropUrl = PreferText(refreshed.BackdropUrl, existing.BackdropUrl),
             PosterUrl = PreferText(refreshed.PosterUrl, existing.PosterUrl),
             SourceList = PreferText(refreshed.SourceList, existing.SourceList),
+            OriginalLanguage = PreferText(refreshed.OriginalLanguage, existing.OriginalLanguage).ToLowerInvariant(),
+            OfficialRating = PreferText(refreshed.OfficialRating, existing.OfficialRating),
+            RatingScore = refreshed.RatingScore ?? existing.RatingScore,
+            RatingSubScore = refreshed.RatingSubScore ?? existing.RatingSubScore,
+            CertificationCountry = PreferText(refreshed.CertificationCountry, existing.CertificationCountry).ToUpperInvariant(),
             Adult = existing.Adult || refreshed.Adult
         };
     }
@@ -569,6 +664,213 @@ public sealed class CinemaPreRollCacheService
         }
 
         return AdultContentMarkers.Any(marker => text.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task<CertificationInfo?> FetchCertificationInfoAsync(
+        string apiKey,
+        LocaleRequest locale,
+        MovieSeed seed,
+        CancellationToken ct)
+    {
+        try
+        {
+            var response = await FetchTmdbJsonAsync<TmdbReleaseDatesResponse>(
+                apiKey,
+                $"/movie/{seed.TmdbId}/release_dates",
+                new Dictionary<string, string>(),
+                ct
+            ).ConfigureAwait(false);
+
+            return PickCertificationInfo(response.Results, locale, seed);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Cinema pre-roll TMDb release dates fetch failed for {TmdbId}", seed.TmdbId);
+            return null;
+        }
+    }
+
+    private CertificationInfo? PickCertificationInfo(
+        IEnumerable<TmdbReleaseCountry>? countries,
+        LocaleRequest locale,
+        MovieSeed seed)
+    {
+        var countryList = (countries ?? Enumerable.Empty<TmdbReleaseCountry>())
+            .Where(country => !string.IsNullOrWhiteSpace(country.CountryCode))
+            .ToList();
+        if (countryList.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var countryCode in BuildCertificationCountryPriority(locale, seed))
+        {
+            var entry = countryList.FirstOrDefault(country =>
+                string.Equals(country.CountryCode, countryCode, StringComparison.OrdinalIgnoreCase));
+            var certification = PickBestCertification(entry);
+            if (string.IsNullOrWhiteSpace(certification))
+            {
+                continue;
+            }
+
+            return BuildCertificationInfo(certification, countryCode);
+        }
+
+        var fallback = countryList
+            .Select(country => new
+            {
+                CountryCode = NormalizeCountry(country.CountryCode),
+                Certification = PickBestCertification(country)
+            })
+            .FirstOrDefault(entry => !string.IsNullOrWhiteSpace(entry.Certification));
+
+        return fallback is null
+            ? null
+            : BuildCertificationInfo(fallback.Certification, fallback.CountryCode);
+    }
+
+    private CertificationInfo BuildCertificationInfo(string certification, string countryCode)
+    {
+        var normalizedCountry = NormalizeCountry(countryCode);
+        var normalizedCertification = TrimOrEmpty(certification);
+        var ratingScore = ResolveRatingScore(normalizedCertification, normalizedCountry);
+        var officialRating = string.IsNullOrWhiteSpace(normalizedCountry)
+            ? normalizedCertification
+            : $"{normalizedCountry}-{normalizedCertification}";
+
+        return new CertificationInfo(
+            officialRating,
+            ratingScore?.Score,
+            ratingScore?.SubScore,
+            normalizedCountry);
+    }
+
+    private MediaBrowser.Model.Entities.ParentalRatingScore? ResolveRatingScore(string certification, string countryCode)
+    {
+        if (string.IsNullOrWhiteSpace(certification))
+        {
+            return null;
+        }
+
+        var attempts = new[]
+        {
+            (Rating: certification, Country: countryCode),
+            (Rating: string.IsNullOrWhiteSpace(countryCode) ? certification : $"{countryCode}-{certification}", Country: countryCode),
+            (Rating: certification, Country: string.Empty)
+        };
+
+        foreach (var attempt in attempts)
+        {
+            try
+            {
+                var score = _localization.GetRatingScore(attempt.Rating, attempt.Country);
+                if (score is not null)
+                {
+                    return score;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        var numericScore = InferRatingScore(certification, countryCode);
+        return numericScore.HasValue
+            ? new MediaBrowser.Model.Entities.ParentalRatingScore(numericScore.Value, null)
+            : null;
+    }
+
+    private static int? InferRatingScore(string certification, string countryCode)
+    {
+        var value = TrimOrEmpty(certification).ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var compact = value.Replace(" ", string.Empty).Replace("_", "-", StringComparison.Ordinal);
+        if (compact is "G" or "U" or "E" or "L" or "AL" or "ALL" or "A" or "ATP" or "TE" or "TP" or "0")
+        {
+            return 0;
+        }
+
+        if (compact is "PG")
+        {
+            return string.Equals(countryCode, "GB", StringComparison.OrdinalIgnoreCase) ? 8 : 7;
+        }
+
+        if (compact is "PG-13" or "PG13")
+        {
+            return 13;
+        }
+
+        if (compact is "R")
+        {
+            return 17;
+        }
+
+        if (compact is "NC-17" or "NC17" or "X" or "R18")
+        {
+            return 18;
+        }
+
+        var match = System.Text.RegularExpressions.Regex.Match(compact, @"\d{1,2}");
+        if (!match.Success || !int.TryParse(match.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var numeric))
+        {
+            return null;
+        }
+
+        return Math.Clamp(numeric, 0, 18);
+    }
+
+    private static string PickBestCertification(TmdbReleaseCountry? country)
+    {
+        return (country?.ReleaseDates ?? Enumerable.Empty<TmdbReleaseDate>())
+            .Select(entry => new
+            {
+                Certification = TrimOrEmpty(entry.Certification),
+                TypeScore = ScoreReleaseDateType(entry.Type),
+                ReleaseDate = ParseReleaseDate(entry.ReleaseDate)
+            })
+            .Where(entry => !string.IsNullOrWhiteSpace(entry.Certification))
+            .OrderByDescending(entry => entry.TypeScore)
+            .ThenByDescending(entry => entry.ReleaseDate)
+            .Select(entry => entry.Certification)
+            .FirstOrDefault() ?? string.Empty;
+    }
+
+    private static int ScoreReleaseDateType(int type)
+    {
+        return type switch
+        {
+            3 => 60,
+            2 => 50,
+            1 => 40,
+            4 => 30,
+            5 => 20,
+            6 => 10,
+            _ => 0
+        };
+    }
+
+    private static IEnumerable<string> BuildCertificationCountryPriority(LocaleRequest locale, MovieSeed seed)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in new[]
+        {
+            seed.FeedRegion,
+            locale.Region,
+            ExtractRegionFromLanguage(locale.Language),
+            EnglishFallbackRegion,
+            "GB"
+        })
+        {
+            var country = NormalizeCountry(candidate);
+            if (!string.IsNullOrWhiteSpace(country) && seen.Add(country))
+            {
+                yield return country;
+            }
+        }
     }
 
     private async Task<TmdbMovieListResponse?> SafeFetchFeedPageAsync(
@@ -683,6 +985,27 @@ public sealed class CinemaPreRollCacheService
         return builder.ToString();
     }
 
+    private static bool MatchesRequiredOriginalLanguage(TmdbMovie movie, string? requiredOriginalLanguage)
+    {
+        var required = TrimOrEmpty(requiredOriginalLanguage).ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(required))
+        {
+            return true;
+        }
+
+        return string.Equals(
+            TrimOrEmpty(movie.OriginalLanguage).ToLowerInvariant(),
+            required,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsEnglishFallbackLocale(LocaleRequest locale)
+    {
+        return string.Equals(locale.Language, EnglishFallbackLanguage, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(locale.Region, EnglishFallbackRegion, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(locale.RequiredOriginalLanguage, EnglishFallbackOriginalLanguage, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void MergeSeed(IDictionary<int, MovieSeed> target, MovieSeed seed)
     {
         if (!target.TryGetValue(seed.TmdbId, out var existing))
@@ -719,6 +1042,17 @@ public sealed class CinemaPreRollCacheService
         if (ScoreSourceList(seed.SourceList) > ScoreSourceList(existing.SourceList))
         {
             existing.SourceList = seed.SourceList;
+            existing.FeedRegion = seed.FeedRegion;
+        }
+
+        if (string.IsNullOrWhiteSpace(existing.OriginalLanguage) && !string.IsNullOrWhiteSpace(seed.OriginalLanguage))
+        {
+            existing.OriginalLanguage = seed.OriginalLanguage;
+        }
+
+        if (string.IsNullOrWhiteSpace(existing.FeedRegion) && !string.IsNullOrWhiteSpace(seed.FeedRegion))
+        {
+            existing.FeedRegion = seed.FeedRegion;
         }
     }
 
@@ -726,10 +1060,10 @@ public sealed class CinemaPreRollCacheService
     {
         return sourceList?.Trim().ToLowerInvariant() switch
         {
-            "now_playing" => 3d,
-            "upcoming" => 2d,
-            "now_playing_global" => 1.5d,
-            "upcoming_global" => 1d,
+            "now_playing" => 4d,
+            "upcoming" => 3d,
+            "now_playing_english" => 2d,
+            "upcoming_english" => 1d,
             _ => 0d
         };
     }
@@ -742,6 +1076,19 @@ public sealed class CinemaPreRollCacheService
         }
 
         return DateTime.MinValue;
+    }
+
+    private static bool IsCurrentTrailerRelease(string? raw)
+    {
+        var releaseDate = ParseReleaseDate(raw);
+        if (releaseDate == DateTime.MinValue)
+        {
+            return false;
+        }
+
+        var today = DateTime.UtcNow.Date;
+        return releaseDate >= today.AddDays(-RecentReleasePastWindowDays)
+            && releaseDate <= today.AddDays(UpcomingReleaseFutureWindowDays);
     }
 
     private static LocaleRequest BuildLocaleRequest(string? language, string? region, string? regionMode)
@@ -763,6 +1110,18 @@ public sealed class CinemaPreRollCacheService
                 : $"{normalizedLanguage}:{normalizedRegion}",
             IncludeVideoLanguage = $"{iso639},en,null"
         };
+    }
+
+    private static string ExtractRegionFromLanguage(string? language)
+    {
+        var parts = TrimOrEmpty(language).Split('-', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return parts.Length >= 2 ? NormalizeCountry(parts[1]) : string.Empty;
+    }
+
+    private static string NormalizeCountry(string? countryCode)
+    {
+        var value = TrimOrEmpty(countryCode).ToUpperInvariant();
+        return value.Length == 2 && value.All(ch => ch is >= 'A' and <= 'Z') ? value : string.Empty;
     }
 
     private static string NormalizeTmdbRegionMode(string? raw)
@@ -878,8 +1237,9 @@ public sealed class CinemaPreRollCacheService
         fileModel.Locales = reordered;
     }
 
-    private static CacheSnapshot ToSnapshot(LocaleCacheModel snapshot, bool stale)
+    private CacheSnapshot ToSnapshot(LocaleCacheModel snapshot, bool stale)
     {
+        var libraryTmdbIds = GetLibraryMovieTmdbIdSetCached();
         return new CacheSnapshot
         {
             CacheKey = snapshot.CacheKey,
@@ -888,8 +1248,126 @@ public sealed class CinemaPreRollCacheService
             UpdatedAtUtc = snapshot.UpdatedAtUtc,
             TargetItemCount = snapshot.TargetItemCount,
             Stale = stale,
-            Items = NormalizeCacheItems(snapshot.Items)
+            Items = ExcludeLibraryMovies(NormalizeCacheItems(snapshot.Items), libraryTmdbIds)
         };
+    }
+
+    private HashSet<int> GetLibraryMovieTmdbIdSetCached()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (_libraryMovieTmdbIdsCache != null && (now - _libraryMovieTmdbIdsCacheAtUtc) < LibraryTmdbCacheTtlMs)
+        {
+            return _libraryMovieTmdbIdsCache;
+        }
+
+        _libraryMovieTmdbIdsCache = BuildLibraryMovieTmdbIdSet();
+        _libraryMovieTmdbIdsCacheAtUtc = now;
+        return _libraryMovieTmdbIdsCache;
+    }
+
+    private HashSet<int> BuildLibraryMovieTmdbIdSet()
+    {
+        var output = new HashSet<int>();
+        try
+        {
+            var query = new InternalItemsQuery
+            {
+                Recursive = true,
+                IncludeItemTypes = new[] { BaseItemKind.Movie },
+                IsMissing = false,
+                EnableTotalRecordCount = false
+            };
+
+            var items = _libraryManager.GetItemList(query) ?? Array.Empty<BaseItem>();
+            foreach (var item in items)
+            {
+                if (!IsAvailableLibraryItem(item))
+                {
+                    continue;
+                }
+
+                var tmdbId = GetTmdbIdFromItem(item);
+                if (tmdbId > 0)
+                {
+                    output.Add(tmdbId);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cinema pre-roll Jellyfin library TMDb scan failed");
+        }
+
+        return output;
+    }
+
+    private static int GetTmdbIdFromItem(BaseItem item)
+    {
+        if (item?.ProviderIds == null || item.ProviderIds.Count == 0)
+        {
+            return 0;
+        }
+
+        foreach (var key in new[] { "Tmdb", "TMDb", "MovieDb", "TheMovieDb" })
+        {
+            if (!item.ProviderIds.TryGetValue(key, out var raw))
+            {
+                continue;
+            }
+
+            if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var tmdbId) && tmdbId > 0)
+            {
+                return tmdbId;
+            }
+        }
+
+        return 0;
+    }
+
+    private static bool IsAvailableLibraryItem(BaseItem? item)
+    {
+        if (item is null)
+        {
+            return false;
+        }
+
+        if (item.LocationType == LocationType.Virtual)
+        {
+            return false;
+        }
+
+        return item.LocationType == LocationType.FileSystem ||
+               !string.IsNullOrWhiteSpace(item.Path) ||
+               item.RunTimeTicks > 0;
+    }
+
+    private static bool IsMovieInJellyfinLibrary(int tmdbId, HashSet<int> libraryTmdbIds)
+    {
+        return tmdbId > 0 && libraryTmdbIds.Contains(tmdbId);
+    }
+
+    private static List<MovieSeed> ExcludeLibraryMovieSeeds(IReadOnlyList<MovieSeed> seeds, HashSet<int> libraryTmdbIds)
+    {
+        if (seeds.Count == 0 || libraryTmdbIds.Count == 0)
+        {
+            return seeds is List<MovieSeed> list ? list : seeds.ToList();
+        }
+
+        return seeds
+            .Where(seed => !IsMovieInJellyfinLibrary(seed.TmdbId, libraryTmdbIds))
+            .ToList();
+    }
+
+    private static List<CacheItem> ExcludeLibraryMovies(IReadOnlyList<CacheItem> items, HashSet<int> libraryTmdbIds)
+    {
+        if (items.Count == 0 || libraryTmdbIds.Count == 0)
+        {
+            return items is List<CacheItem> list ? list : items.ToList();
+        }
+
+        return items
+            .Where(item => !IsMovieInJellyfinLibrary(item.TmdbId, libraryTmdbIds))
+            .ToList();
     }
 
     private CacheFileModel ReadCacheFile(JMSFusionPlugin plugin)
@@ -904,6 +1382,11 @@ public sealed class CinemaPreRollCacheService
         {
             using var stream = File.OpenRead(filePath);
             var parsed = JsonSerializer.Deserialize<CacheFileModel>(stream, JsonOptions) ?? new CacheFileModel();
+            if (parsed.Version != CacheVersion)
+            {
+                return new CacheFileModel();
+            }
+
             parsed.Version = CacheVersion;
             parsed.Locales = parsed.Locales is null
                 ? new Dictionary<string, LocaleCacheModel>(StringComparer.OrdinalIgnoreCase)

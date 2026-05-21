@@ -151,6 +151,114 @@ namespace Jellyfin.Plugin.JMSFusion
 
         [JsonPropertyName("allowSharedCastViewerForUsers")]
         public bool AllowSharedCastViewerForUsers { get; set; } = false;
+
+        [JsonPropertyName("enableSerrIntegration")]
+        public bool EnableSerrIntegration { get; set; } = false;
+
+        [JsonPropertyName("serrBaseUrl")]
+        public string SerrBaseUrl { get; set; } = string.Empty;
+
+        [JsonPropertyName("serrApiKey")]
+        public string SerrApiKey { get; set; } = string.Empty;
+
+        [JsonPropertyName("serrDefaultLanguage")]
+        public string SerrDefaultLanguage { get; set; } = "tr";
+
+        [JsonPropertyName("serrRequestAsJellyfinUser")]
+        public bool SerrRequestAsJellyfinUser { get; set; } = true;
+
+        [JsonPropertyName("serrConfirmRequests")]
+        public bool SerrConfirmRequests { get; set; } = true;
+
+        [JsonPropertyName("serrShowMissingSearchButton")]
+        public bool SerrShowMissingSearchButton { get; set; } = true;
+
+        [JsonPropertyName("serrEnableNotifications")]
+        public bool SerrEnableNotifications { get; set; } = true;
+
+        [JsonPropertyName("serrRequests")]
+        public List<SerrRequestEntry> SerrRequests { get; set; } = new();
+
+        [JsonPropertyName("serrRequestsRevision")]
+        public long SerrRequestsRevision { get; set; } = 0;
+
+        [JsonPropertyName("enableArrIntegration")]
+        public bool EnableArrIntegration { get; set; } = false;
+
+        [JsonPropertyName("arrSonarrEnabled")]
+        public bool ArrSonarrEnabled { get; set; } = false;
+
+        [JsonPropertyName("arrSonarrBaseUrl")]
+        public string ArrSonarrBaseUrl { get; set; } = string.Empty;
+
+        [JsonPropertyName("arrSonarrApiKey")]
+        public string ArrSonarrApiKey { get; set; } = string.Empty;
+
+        [JsonPropertyName("arrSonarrRootFolderPath")]
+        public string ArrSonarrRootFolderPath { get; set; } = string.Empty;
+
+        [JsonPropertyName("arrSonarrQualityProfileId")]
+        public int ArrSonarrQualityProfileId { get; set; } = 0;
+
+        [JsonPropertyName("arrSonarrLanguageProfileId")]
+        public int ArrSonarrLanguageProfileId { get; set; } = 0;
+
+        [JsonPropertyName("arrSonarrSeasonFolder")]
+        public bool ArrSonarrSeasonFolder { get; set; } = true;
+
+        [JsonPropertyName("arrSonarrSearchOnRequest")]
+        public bool ArrSonarrSearchOnRequest { get; set; } = true;
+
+        [JsonPropertyName("arrRadarrEnabled")]
+        public bool ArrRadarrEnabled { get; set; } = false;
+
+        [JsonPropertyName("arrRadarrBaseUrl")]
+        public string ArrRadarrBaseUrl { get; set; } = string.Empty;
+
+        [JsonPropertyName("arrRadarrApiKey")]
+        public string ArrRadarrApiKey { get; set; } = string.Empty;
+
+        [JsonPropertyName("arrRadarrRootFolderPath")]
+        public string ArrRadarrRootFolderPath { get; set; } = string.Empty;
+
+        [JsonPropertyName("arrRadarrQualityProfileId")]
+        public int ArrRadarrQualityProfileId { get; set; } = 0;
+
+        [JsonPropertyName("arrRadarrSearchOnRequest")]
+        public bool ArrRadarrSearchOnRequest { get; set; } = true;
+    }
+
+    public class SerrRequestEntry
+    {
+        public string Id { get; set; } = string.Empty;
+        public string JellyfinUserId { get; set; } = string.Empty;
+        public string JellyfinUserName { get; set; } = string.Empty;
+        public bool JellyfinUserIsAdmin { get; set; } = false;
+        public string Title { get; set; } = string.Empty;
+        public string MediaType { get; set; } = string.Empty;
+        public int MediaId { get; set; } = 0;
+        public int? TvdbId { get; set; }
+        public List<int> Seasons { get; set; } = new();
+        public List<SerrEpisodeSelectionEntry> Episodes { get; set; } = new();
+        public bool RequestAllSeasons { get; set; } = false;
+        public bool Is4K { get; set; } = false;
+        public string Source { get; set; } = string.Empty;
+        public string JellyfinItemId { get; set; } = string.Empty;
+        public string Status { get; set; } = "pending";
+        public int? SerrRequestId { get; set; }
+        public int? SerrMediaStatus { get; set; }
+        public int? SerrRequestStatus { get; set; }
+        public string Error { get; set; } = string.Empty;
+        public long CreatedAtUtc { get; set; } = 0;
+        public long UpdatedAtUtc { get; set; } = 0;
+        public long CompletedAtUtc { get; set; } = 0;
+    }
+
+    public class SerrEpisodeSelectionEntry
+    {
+        public int SeasonNumber { get; set; } = 0;
+        public int EpisodeNumber { get; set; } = 0;
+        public string Name { get; set; } = string.Empty;
     }
 
     public class SharedRadioStationEntry

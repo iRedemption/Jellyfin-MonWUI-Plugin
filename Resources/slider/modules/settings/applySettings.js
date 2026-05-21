@@ -490,6 +490,7 @@ const USER_ONLY_KEYS = [
             enableSubtitleCustomizerModule: formData.get('enableSubtitleCustomizerModule') === 'on',
             enableParentalPinModule: formData.get('enableParentalPinModule') === 'on',
             enableDetailsModalModule: formData.get('enableDetailsModalModule') === 'on',
+            enableSerrArrIntegrationModule: formData.get('enableSerrArrIntegrationModule') === 'on',
             enableCastModule,
             allowSharedCastViewerForUsers,
             detailsModalTmdbReviewsEnabled: formData.get('detailsModalTmdbReviewsEnabled') === 'on',
@@ -520,6 +521,10 @@ const USER_ONLY_KEYS = [
               config.profileChooserAutoOpenRequireQuickLogin !== false
             ),
             profileChooserRememberTokens: formData.get('profileChooserRememberTokens') === 'on',
+            profileChooserHideUsersFromRegularUsers: boolFromFd(
+              'profileChooserHideUsersFromRegularUsers',
+              config.profileChooserHideUsersFromRegularUsers === true
+            ),
 
             enableRecentRows: formData.get('enableRecentRows') === 'on',
             showRecentRowsHeroCards: formData.get('showRecentRowsHeroCards') === 'on',
@@ -786,6 +791,7 @@ const USER_ONLY_KEYS = [
             showFavoriteButton: formData.get('showFavoriteButton') === 'on',
             favoriteBackgroundImageType: formData.get('favoriteBackgroundImageType'),
             watchlistTabsSliderEnabled: formData.get('watchlistTabsSliderEnabled') === 'on',
+            watchlistSharingEnabled: formData.get('watchlistSharingEnabled') === 'on',
             watchlistAutoRemovePlayed: formData.get('watchlistAutoRemovePlayed') === 'on',
             watchlistAutoRemovePlayedFromFavorites: formData.get('watchlistAutoRemovePlayedFromFavorites') === 'on',
             watchlistImportFavoritesOnStartup: formData.get('watchlistImportFavoritesOnStartup') === 'on',

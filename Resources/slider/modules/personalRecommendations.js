@@ -76,11 +76,13 @@ const GENRE_LAZY = true;
 const MOBILE_ROW_BATCH_SIZE = 1;
 const DESKTOP_INITIAL_GENRE_LOADS = 1;
 const GENRE_BATCH_SIZE = 1;
-const GENRE_ROOT_MARGIN = IS_MOBILE_WEBVIEW ? "720px 0px" : "500px 0px";
+const GENRE_ROOT_MARGIN = IS_MOBILE
+  ? (IS_MOBILE_WEBVIEW ? "920px 0px" : "720px 0px")
+  : "500px 0px";
 const MANAGED_ROW_RELEASE_ROOT_MARGIN = IS_MOBILE
-  ? (IS_MOBILE_WEBVIEW ? "0px 0px 78% 0px" : "0px 0px 60% 0px")
+  ? (IS_MOBILE_WEBVIEW ? "0px 0px 100% 0px" : "0px 0px 90% 0px")
   : "0px 0px 22% 0px";
-const GENRE_FIRST_SCROLL_PX = Number(getConfig()?.genreRowsFirstBatchScrollPx) || (IS_MOBILE_WEBVIEW ? 320 : 200);
+const GENRE_FIRST_SCROLL_PX = Number(getConfig()?.genreRowsFirstBatchScrollPx) || (IS_MOBILE_WEBVIEW ? 520 : 360);
 const MIN_GENRE_VISIBLE_CARD_COUNT = 3;
 const PRC_LOCK_DOWN_SCROLL = (getConfig()?.prcLockDownScrollDuringLoad === true);
 
@@ -795,8 +797,13 @@ function scheduleDeferredGenreHubsRender({ force = false, seq = __deferredHomeSe
       }
       try {
         await waitForManagedSectionDependencyCompletion("genreHubs", {
-          timeoutMs: 25000,
           requireCompletion: true,
+          allowTimeout: false,
+          timeoutMs: 0,
+          isStillValid: () => (
+            seq === __deferredHomeSectionSeq &&
+            hasActivePersonalRecsHomeSections()
+          ),
         });
       } catch {}
       if (seq !== __deferredHomeSectionSeq || !hasActivePersonalRecsHomeSections()) {
@@ -819,6 +826,7 @@ function scheduleDeferredGenreHubsRender({ force = false, seq = __deferredHomeSe
     timeoutMs: 25000,
     force,
     reuseKey: false,
+    rootMargin: MANAGED_ROW_RELEASE_ROOT_MARGIN,
     getAnchor: () => {
       const wrap = anchorWrap?.isConnected
         ? anchorWrap
@@ -2205,13 +2213,7 @@ function ensureBecauseContainer(indexPage, key = "0") {
       </h2>
     </div>
     <div class="personal-recs-scroll-wrap">
-      <button class="hub-scroll-btn hub-scroll-left" aria-label="${(config.languageLabels?.scrollLeft) || "Sola kaydır"}" aria-disabled="true">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-      </button>
       <div class="itemsContainer personal-recs-row byw-row" role="list"></div>
-      <button class="hub-scroll-btn hub-scroll-right" aria-label="${(config.languageLabels?.scrollRight) || "Sağa kaydır"}" aria-disabled="true">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
-      </button>
     </div>
   `;
   const scrollWrap = section.querySelector('.personal-recs-scroll-wrap');
@@ -2667,13 +2669,7 @@ function ensurePersonalRecsContainer(indexPage) {
   </div>
 
   <div class="personal-recs-scroll-wrap">
-    <button class="hub-scroll-btn hub-scroll-left" aria-label="${(config.languageLabels && config.languageLabels.scrollLeft) || "Sola kaydır"}" aria-disabled="true">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-    </button>
     <div class="itemsContainer personal-recs-row" role="list"></div>
-    <button class="hub-scroll-btn hub-scroll-right" aria-label="${(config.languageLabels && config.languageLabels.scrollRight) || "Sağa kaydır"}" aria-disabled="true">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
-    </button>
   </div>
 `;
 
@@ -3560,6 +3556,52 @@ function createRecommendationCard(item, serverId, renderOptions = false) {
   return card;
 }
 
+function createHubScrollButton(side = "right") {
+  const isLeft = side === "left";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `hub-scroll-btn hub-scroll-${isLeft ? "left" : "right"}`;
+  btn.setAttribute(
+    "aria-label",
+    isLeft
+      ? ((config.languageLabels && config.languageLabels.scrollLeft) || "Sola kaydır")
+      : ((config.languageLabels && config.languageLabels.scrollRight) || "Sağa kaydır")
+  );
+  btn.setAttribute("aria-disabled", "true");
+  btn.disabled = true;
+  btn.innerHTML = isLeft
+    ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>`
+    : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>`;
+  return btn;
+}
+
+function ensureHubScrollButton(wrap, row, side = "right") {
+  if (!wrap || !row) return null;
+  const isLeft = side === "left";
+  const selector = isLeft ? ".hub-scroll-left" : ".hub-scroll-right";
+  let btn = wrap.querySelector?.(selector) || null;
+  if (btn) return btn;
+
+  btn = createHubScrollButton(side);
+  try {
+    if (isLeft) {
+      wrap.insertBefore(btn, row);
+    } else if (row.nextSibling) {
+      wrap.insertBefore(btn, row.nextSibling);
+    } else {
+      wrap.appendChild(btn);
+    }
+  } catch {
+    return null;
+  }
+  return btn;
+}
+
+function removeHubScrollButton(btn) {
+  if (!btn) return;
+  try { btn.remove(); } catch {}
+}
+
 function cleanupScroller(row) {
   const s = row && row.__scroller;
   if (!s) {
@@ -3571,6 +3613,7 @@ function cleanupScroller(row) {
   }
 
   try { s.clearAnimCleanupTimer?.(); } catch {}
+  try { s.releaseButtons?.({ remove: true }); } catch {}
   try { s.mo?.disconnect?.(); } catch {}
   try { s.ro?.disconnect?.(); } catch {}
 
@@ -3595,6 +3638,10 @@ function cleanupScroller(row) {
 export function setupScroller(row) {
   if (row.dataset.scrollerMounted === "1") {
     const s = row.__scroller;
+    if (s?.dynamicButtons) {
+      requestAnimationFrame(() => row.dispatchEvent(new Event("scroll")));
+      return;
+    }
     const btnOk =
       !!(s && (s.btnL?.isConnected || s.btnR?.isConnected));
     if (btnOk) {
@@ -3607,8 +3654,10 @@ export function setupScroller(row) {
   row.dataset.scrollerMounted = "1";
 
   const wrap = row.closest(".personal-recs-scroll-wrap") || row.parentElement;
-  const btnL = wrap?.querySelector?.(".hub-scroll-left") || null;
-  const btnR = wrap?.querySelector?.(".hub-scroll-right") || null;
+  let btnL = wrap?.querySelector?.(".hub-scroll-left") || null;
+  let btnR = wrap?.querySelector?.(".hub-scroll-right") || null;
+  let boundBtnL = null;
+  let boundBtnR = null;
   const canScroll = () => row.scrollWidth > row.clientWidth + 2;
   const prefersReducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
   const supportsNativeSmoothScroll =
@@ -3650,45 +3699,6 @@ export function setupScroller(row) {
     _animHardStopTimer = window.setTimeout(endProgrammaticScroll, scrollMaxMs);
   };
 
-  const updateButtonsNow = () => {
-    const scrollable = canScroll();
-    const max = maxScrollLeft();
-    const atStart = row.scrollLeft <= SNAP_EPSILON;
-    const atEnd = row.scrollLeft >= max - SNAP_EPSILON;
-    if (btnL) {
-      btnL.setAttribute("aria-disabled", scrollable ? "false" : "true");
-      btnL.disabled = !scrollable;
-      if (scrollable && atStart) {
-        btnL.dataset.wrapTarget = "end";
-      } else {
-        delete btnL.dataset.wrapTarget;
-      }
-    }
-    if (btnR) {
-      btnR.setAttribute("aria-disabled", scrollable ? "false" : "true");
-      btnR.disabled = !scrollable;
-      if (scrollable && atEnd) {
-        btnR.dataset.wrapTarget = "start";
-      } else {
-        delete btnR.dataset.wrapTarget;
-      }
-    }
-  };
-
-  const scheduleUpdate = () => {
-    if (_rafToken) return;
-    _rafToken = requestAnimationFrame(() => {
-      _rafToken = null;
-      updateButtonsNow();
-    });
-  };
-
-  const mo = new MutationObserver(() => scheduleUpdate());
-  mo.observe(row, { childList: true });
-
-  const onLoadCapture = () => scheduleUpdate();
-  row.addEventListener("load", onLoadCapture, true);
-
   const scrollToPosition = (left) => {
     if (!canScroll()) return;
     armProgrammaticScroll();
@@ -3727,6 +3737,11 @@ export function setupScroller(row) {
     scrollByStep(dir, evt);
   }
 
+  const unbindScrollerButton = (btn, handler) => {
+    if (!btn || !handler) return;
+    try { btn.removeEventListener("click", handler); } catch {}
+  };
+
   const onClickL = (e) => { e.preventDefault(); e.stopPropagation(); doScroll(-1, e); };
   const onClickR = (e) => { e.preventDefault(); e.stopPropagation(); doScroll( 1, e); };
   const blurAfterPointerClick = (btn, e) => {
@@ -3736,8 +3751,93 @@ export function setupScroller(row) {
   };
   const onClickL2 = (e) => { onClickL(e); blurAfterPointerClick(btnL, e); };
   const onClickR2 = (e) => { onClickR(e); blurAfterPointerClick(btnR, e); };
-  if (btnL) btnL.addEventListener("click", onClickL2);
-  if (btnR) btnR.addEventListener("click", onClickR2);
+
+  const syncScrollerButtonState = () => {
+    const s = row.__scroller;
+    if (!s) return;
+    s.btnL = btnL;
+    s.btnR = btnR;
+  };
+
+  const bindScrollerButtons = () => {
+    if (btnL && boundBtnL !== btnL) {
+      unbindScrollerButton(boundBtnL, onClickL2);
+      btnL.addEventListener("click", onClickL2);
+      boundBtnL = btnL;
+    }
+    if (btnR && boundBtnR !== btnR) {
+      unbindScrollerButton(boundBtnR, onClickR2);
+      btnR.addEventListener("click", onClickR2);
+      boundBtnR = btnR;
+    }
+    syncScrollerButtonState();
+  };
+
+  const releaseButtons = ({ remove = false } = {}) => {
+    unbindScrollerButton(boundBtnL, onClickL2);
+    unbindScrollerButton(boundBtnR, onClickR2);
+    boundBtnL = null;
+    boundBtnR = null;
+    if (remove) {
+      removeHubScrollButton(btnL);
+      removeHubScrollButton(btnR);
+      btnL = null;
+      btnR = null;
+    }
+    syncScrollerButtonState();
+  };
+
+  const ensureScrollerButtons = () => {
+    if (!wrap) return;
+    btnL = btnL?.isConnected ? btnL : ensureHubScrollButton(wrap, row, "left");
+    btnR = btnR?.isConnected ? btnR : ensureHubScrollButton(wrap, row, "right");
+    bindScrollerButtons();
+  };
+
+  const updateButtonsNow = () => {
+    const scrollable = canScroll();
+    if (!scrollable) {
+      releaseButtons({ remove: true });
+      return;
+    }
+
+    ensureScrollerButtons();
+    const max = maxScrollLeft();
+    const atStart = row.scrollLeft <= SNAP_EPSILON;
+    const atEnd = row.scrollLeft >= max - SNAP_EPSILON;
+    if (btnL) {
+      btnL.setAttribute("aria-disabled", "false");
+      btnL.disabled = false;
+      if (atStart) {
+        btnL.dataset.wrapTarget = "end";
+      } else {
+        delete btnL.dataset.wrapTarget;
+      }
+    }
+    if (btnR) {
+      btnR.setAttribute("aria-disabled", "false");
+      btnR.disabled = false;
+      if (atEnd) {
+        btnR.dataset.wrapTarget = "start";
+      } else {
+        delete btnR.dataset.wrapTarget;
+      }
+    }
+  };
+
+  const scheduleUpdate = () => {
+    if (_rafToken) return;
+    _rafToken = requestAnimationFrame(() => {
+      _rafToken = null;
+      updateButtonsNow();
+    });
+  };
+
+  const mo = new MutationObserver(() => scheduleUpdate());
+  mo.observe(row, { childList: true });
+
+  const onLoadCapture = () => scheduleUpdate();
+  row.addEventListener("load", onLoadCapture, true);
 
   const onWheel = (e) => {
     const horizontalIntent = Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey;
@@ -3771,6 +3871,7 @@ export function setupScroller(row) {
   const ro = new ResizeObserver(() => scheduleUpdate());
   ro.observe(row);
   row.__scroller = {
+    dynamicButtons: true,
     btnL,
     btnR,
     onClickL: onClickL2,
@@ -3783,7 +3884,8 @@ export function setupScroller(row) {
     ro,
     mo,
     onLoadCapture,
-    clearAnimCleanupTimer
+    clearAnimCleanupTimer,
+    releaseButtons
   };
   row.addEventListener("jms:cleanup", () => {
     try { cleanupScroller(row); } catch {}
@@ -3999,17 +4101,11 @@ function ensureGenreSectionElement(idx) {
         </div>
         <span class="gh-see-all-tip">${(config.languageLabels?.seeAll) || "Tümünü gör"}</span>
       </h2>
-    </div>
-    <div class="personal-recs-scroll-wrap">
-      <button class="hub-scroll-btn hub-scroll-left" aria-label="${(config.languageLabels && config.languageLabels.scrollLeft) || "Sola kaydır"}" aria-disabled="true">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
-      </button>
-      <div class="itemsContainer genre-row" role="list"></div>
-      <button class="hub-scroll-btn hub-scroll-right" aria-label="${(config.languageLabels && config.languageLabels.scrollRight) || "Sağa kaydır"}" aria-disabled="true">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.59 16.59 13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
-      </button>
-    </div>
-  `;
+	    </div>
+	    <div class="personal-recs-scroll-wrap">
+	      <div class="itemsContainer genre-row" role="list"></div>
+	    </div>
+	  `;
 
   const scrollWrap = section.querySelector('.personal-recs-scroll-wrap');
   const heroHost = document.createElement('div');
