@@ -417,6 +417,9 @@ function renderPlayer(container, kind, src) {
   video.preload = "metadata";
   video.classList.add("studio-trailer-video");
   applyPreviewTrailerAudioToVideo(video, { config: getConfig(), mutedByDevice: isMobileLike() });
+  video.addEventListener("loadedmetadata", () => {
+    applyPreviewTrailerAudioToVideo(video, { config: getConfig(), mutedByDevice: isMobileLike() });
+  }, { once: true });
   container.appendChild(video);
 }
 

@@ -3,7 +3,7 @@ import { withServer } from "./jfUrl.js";
 import { getConfig, getDetailsModalRuntimeConfig } from "./config.js";
 import { getLanguageLabels } from "../language/index.js";
 import { CollectionCacheDB } from "./collectionCacheDb.js";
-import { formatOfficialRatingLabel, getYoutubeEmbedUrl } from "./utils.js";
+import { formatOfficialRatingLabel, getYoutubeEmbedUrl, applyPreviewTrailerAudioToVideo } from "./utils.js";
 import { getGlobalTmdbApiKey, sanitizeTmdbApiKey } from "./jmsPluginConfig.js";
 import { ensureStudioHubLogoFromTmdb, ensureStudioHubManualEntry, JMS_STUDIO_HUB_MANUAL_ENTRY_ADDED_EVENT } from "./studioHubsShared.js";
 import { showNotification } from "./player/ui/notification.js";
@@ -1663,7 +1663,6 @@ async function startHeroTrailer(root, item, { signal } = {}) {
           const v = document.createElement("video");
           v.dataset.jmsHeroPreview = "1";
           v.autoplay = true;
-          v.muted = false;
           v.playsInline = true;
           v.loop = false;
 
@@ -1677,6 +1676,11 @@ async function startHeroTrailer(root, item, { signal } = {}) {
             objectFit: "cover",
             display: "block",
           });
+
+          applyPreviewTrailerAudioToVideo(v, { config });
+          v.addEventListener("loadedmetadata", () => {
+            applyPreviewTrailerAudioToVideo(v, { config });
+          }, { once: true });
 
           showImg(true);
           try { if (replayBtn) replayBtn.disabled = false; } catch {}

@@ -844,6 +844,7 @@ export function createVideoModal({ showButtons = true, context = 'monwui-dot' } 
     video.src = url;
     applyPreviewTrailerAudioToVideo(video, { config: getConfig(), soundOn: modalState._soundOn });
     video.addEventListener('loadedmetadata', () => {
+      applyPreviewTrailerAudioToVideo(video, { config: getConfig(), soundOn: modalState._soundOn });
       video.currentTime = 10 * 60;
       Promise.resolve(video.play()).catch(e => { if (e.name !== 'AbortError') console.warn('Video oynatma hatası:', e); });
     }, { once: true });

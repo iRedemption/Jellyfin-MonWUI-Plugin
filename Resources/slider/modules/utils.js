@@ -1643,15 +1643,16 @@ function clearPreviewPlaybackFlag() {
     }
 
     videoElement.src = introUrl;
+    videoElement.load();
     const audioState = applyPreviewTrailerAudioToVideo(videoElement, { config });
     runtimePreviewVolumePercent = audioState.effectivePercent;
-    videoElement.load();
     const onMeta = () => {
       videoElement.removeEventListener("loadedmetadata", onMeta);
       if (!shouldKeepPreviewAlive(hoverId)) {
         fullCleanup();
         return;
       }
+      applyPreviewTrailerAudioToVideo(videoElement, { config });
       if (autoPreviewActive && autoTrailerSuspended) {
         autoPreviewPending = true;
         try { videoElement.pause(); } catch {}
